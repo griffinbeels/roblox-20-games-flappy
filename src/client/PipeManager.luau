@@ -1,82 +1,48 @@
 --[[
 	PipeManager.luau
-	
+
 	Creates, recycles, and manages pipe PAIRS with dynamic gap sizes.
 	Each spawn creates a TOP pipe and BOTTOM pipe at the same X position.
 	The player must fly through the gap between them.
-	
-	SPAWNING LOGIC:
-	- Pre-spawns pipe pairs at fixed X positions ahead of the player
-	- Each pair has a randomized gap position (Y) and gap size
-	- Gap size can decrease over time for difficulty progression
-	- Pipes are recycled when they go off-screen behind the player
-	
-	CONFIGURATION:
-	- Gap size: minimum gap, maximum gap, and how it changes with distance
-	- Gap position: randomized within playable area
-	- Spacing between pipe pairs: randomized within range
+
+	All pipe configuration and spawn logic lives in PipeConfig.luau.
+	This module handles lifecycle: spawning, pooling, scoring, and recycling.
 ]]
 
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
+local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local PipeConfig = require(ReplicatedStorage.Shared.PipeConfig)
 local Pipe = require(script.Parent.Pipe)
-local PipeType = require(ReplicatedStorage.Shared.PipeType)
 
 local PipeManager = {}
 PipeManager.__index = PipeManager
 
 -- State
-local activePipePairs = {} -- Each entry is {topPipe, bottomPipe, scored}
-local pipePool = {top = {}, bottom = {}}
+local activePipePairs = {} -- Each entry is {top, bottom, scored, xPosition, styleIndex}
+local pipePools = {}       -- Keyed by "styleIndex_orientation", e.g. "1_top"
 local updateConnection = nil
 local nextSpawnX = 0
-local currentPipeType = nil
 local SpeedManager = nil
 local PlayerController = nil
 local onPipePassedCallback = nil
 local totalDistanceTraveled = 0
+local previousGapY = nil
 
--- Configuration (uses Constants for easy adjustment, can be overridden at runtime)
-local config = {
-	-- PIPE VISIBILITY SETTINGS
-	-- Adjust these to ensure pipes spawn/despawn off-screen
-	-- The camera shows roughly 60-80 studs of horizontal view
-	
-	-- How many pipe pairs to pre-spawn ahead of player
-	-- Higher = more pipes in the world at once, smoother experience
-	preSpawnCount = 6,
-	
-	-- Distance ahead of player to spawn new pipes (must be off-screen right)
-	-- Should be larger than half the camera view width
-	spawnAheadDistance = 120,
-	
-	-- Distance behind player to despawn pipes (must be off-screen left)
-	-- Should be larger than half the camera view width
-	despawnBehindDistance = 80,
-	
-	-- Spacing between pipe pairs (studs) - from Constants
-	minSpacing = Constants.PIPE.SPACING_MIN,
-	maxSpacing = Constants.PIPE.SPACING_MAX,
-	
-	-- First pipe pair distance from player start - from Constants
-	minFirstPipeDistance = Constants.PIPE.FIRST_PIPE_MIN,
-	maxFirstPipeDistance = Constants.PIPE.FIRST_PIPE_MAX,
-	
-	-- Gap configuration (the space player flies through) - from Constants
-	minGapSize = Constants.PIPE.GAP_MIN,
-	maxGapSize = Constants.PIPE.GAP_MAX,
-	
-	-- Gap position bounds (Y position where the gap center can be) - from Constants
-	minGapY = Constants.PIPE.GAP_Y_MIN,
-	maxGapY = Constants.PIPE.GAP_Y_MAX,
-	
-	-- Difficulty progression: gap shrinks as player travels - from Constants
-	gapShrinkRate = Constants.PIPE.GAP_SHRINK_RATE,
-}
+--[[
+	Resolved styles table — built at init time.
+	Each entry mirrors the PipeConfig.STYLES entry but with a `modelTemplate`
+	field pointing to the loaded Model (or nil for Part-based styles).
+]]
+local resolvedStyles = {}
 
--- Playable area height (from Constants)
-local PLAY_AREA_HEIGHT = Constants.BOUNDARIES.MAX_Y - Constants.BOUNDARIES.MIN_Y -- 30 studs
+--[[
+	Returns the pool key for a given style index and orientation.
+]]
+local function poolKey(styleIndex, orientation)
+	return styleIndex .. "_" .. orientation
+end
 
 --[[
 	Initializes the PipeManager.
@@ -86,9 +52,43 @@ local PLAY_AREA_HEIGHT = Constants.BOUNDARIES.MAX_Y - Constants.BOUNDARIES.MIN_Y
 function PipeManager.init(playerCtrl, speedMgr)
 	PlayerController = playerCtrl
 	SpeedManager = speedMgr
-	currentPipeType = PipeType.getDefault()
 	nextSpawnX = 0
 	totalDistanceTraveled = 0
+	previousGapY = nil
+
+	-- Resolve all styles from PipeConfig.STYLES
+	resolvedStyles = {}
+	local styles = PipeConfig.STYLES
+	if not styles or #styles == 0 then
+		styles = {
+			{ COLOR = Color3.fromRGB(0, 200, 0), MATERIAL = Enum.Material.SmoothPlastic },
+		}
+	end
+
+	for i, styleDef in ipairs(styles) do
+		local resolved = {
+			color = styleDef.COLOR,
+			material = styleDef.MATERIAL,
+			modelTemplate = nil,
+		}
+
+		local assetId = styleDef.MODEL_ASSET_ID
+		if assetId and assetId ~= "" then
+			local templatesFolder = ReplicatedStorage:FindFirstChild("PipeTemplates")
+			if templatesFolder then
+				local template = templatesFolder:FindFirstChild(tostring(assetId))
+				if template then
+					resolved.modelTemplate = template
+				else
+					warn("[PipeManager] No template found in PipeTemplates for asset ID: " .. tostring(assetId))
+				end
+			else
+				warn("[PipeManager] ReplicatedStorage.PipeTemplates folder not found")
+			end
+		end
+
+		resolvedStyles[i] = resolved
+	end
 end
 
 --[[
@@ -108,155 +108,99 @@ function PipeManager.setOnPipePassed(callback)
 end
 
 --[[
-	Updates configuration at runtime.
-	@param newConfig table - Partial config table to merge
-]]
-function PipeManager.setConfig(newConfig)
-	for key, value in pairs(newConfig) do
-		if config[key] ~= nil then
-			config[key] = value
-		end
-	end
-end
-
---[[
-	Gets current configuration.
-	@return table - Current config
-]]
-function PipeManager.getConfig()
-	return config
-end
-
---[[
-	Calculates the current gap size based on distance traveled.
-	Gap starts large and shrinks over time for increasing difficulty.
-	@return number - Current gap size in studs
-]]
-local function getCurrentGapSize()
-	local baseGap = config.maxGapSize
-	local shrinkAmount = totalDistanceTraveled * config.gapShrinkRate
-	local currentGap = baseGap - shrinkAmount
-	
-	-- Clamp to minimum gap size
-	return math.max(config.minGapSize, currentGap)
-end
-
---[[
-	Generates a random gap Y position within bounds.
-	@param gapSize number - Size of the gap
-	@return number - Y position for the center of the gap
-]]
-local function getRandomGapY(gapSize)
-	-- Ensure the gap fits within the playable area
-	local halfGap = gapSize / 2
-	local minY = Constants.BOUNDARIES.MIN_Y + halfGap + 2 -- Leave room for bottom pipe
-	local maxY = Constants.BOUNDARIES.MAX_Y - halfGap - 2 -- Leave room for top pipe
-	
-	-- Also respect configured bounds
-	minY = math.max(minY, config.minGapY)
-	maxY = math.min(maxY, config.maxGapY)
-	
-	-- Random position within valid range
-	return minY + math.random() * (maxY - minY)
-end
-
---[[
-	Calculates a randomized spacing between pipe pairs.
-	@return number - Spacing in studs
-]]
-local function getRandomSpacing()
-	local baseSpacing = config.minSpacing + math.random() * (config.maxSpacing - config.minSpacing)
-	
-	-- Slightly increase spacing at higher speeds for fairness
-	if SpeedManager then
-		local speedMultiplier = SpeedManager.getCurrentMultiplier()
-		baseSpacing = baseSpacing * (1 + (speedMultiplier - 1) * 0.2)
-	end
-	
-	return baseSpacing
-end
-
---[[
-	Gets or creates a pipe from the pool.
+	Gets or creates a pipe from the pool for a specific style.
+	@param styleIndex number - Index into resolvedStyles
 	@param orientation string - "top" or "bottom"
 	@param xPosition number - X position for the pipe
 	@param height number - Height of the pipe
 	@return Pipe - Pipe instance
 ]]
-local function getPipeFromPool(orientation, xPosition, height)
-	local pool = pipePool[orientation]
-	
+local function getPipeFromPool(styleIndex, orientation, xPosition, height)
+	local key = poolKey(styleIndex, orientation)
+	local pool = pipePools[key]
+
 	-- Try to reuse from pool
-	if #pool > 0 then
+	if pool and #pool > 0 then
 		local pipe = table.remove(pool)
 		pipe:setPositionAndHeight(xPosition, height)
 		pipe:resetScored()
 		return pipe
 	end
-	
-	-- Create new pipe
-	return Pipe.new(currentPipeType, orientation, xPosition, height)
+
+	-- Create new pipe with the resolved style
+	local style = resolvedStyles[styleIndex]
+	return Pipe.new(orientation, xPosition, height, style)
 end
 
 --[[
 	Spawns a pipe pair (top + bottom) at the specified X position.
+	Uses PipeConfig functions for all spawn decisions.
 	@param xPosition number - X position to spawn at
+	@param speedMultiplier number|nil - Speed override for spacing calculation
+	@return number - The spacing to use before the next pipe pair
 ]]
-local function spawnPipePair(xPosition)
-	local gapSize = getCurrentGapSize()
-	local gapY = getRandomGapY(gapSize)
-	
-	-- Calculate pipe heights based on gap position
-	-- Top pipe: from MAX_Y down to the top of the gap
-	local topPipeHeight = Constants.BOUNDARIES.MAX_Y - (gapY + gapSize / 2)
-	
-	-- Bottom pipe: from MIN_Y up to the bottom of the gap
-	local bottomPipeHeight = (gapY - gapSize / 2) - Constants.BOUNDARIES.MIN_Y
-	
-	-- Ensure minimum heights (at least 1 stud)
-	topPipeHeight = math.max(1, topPipeHeight)
-	bottomPipeHeight = math.max(1, bottomPipeHeight)
-	
+local function spawnPipePair(xPosition, speedMultiplier)
+	-- Resolve speed
+	local spd = speedMultiplier
+	if not spd and SpeedManager then
+		spd = SpeedManager.getCurrentMultiplier()
+	end
+
+	-- Make spawn decisions via PipeConfig
+	local gapSize = PipeConfig.getGapSize(totalDistanceTraveled)
+	local gapY = PipeConfig.getGapY(gapSize, previousGapY)
+	local spacing = PipeConfig.getSpacing(spd)
+	local styleIndex = PipeConfig.getStyleIndex(#resolvedStyles)
+
+	previousGapY = gapY
+
+	-- Calculate pipe heights
+	local topHeight, bottomHeight = PipeConfig.getPipeHeights(gapY, gapSize)
+
 	-- Create the pipe pair
-	local topPipe = getPipeFromPool("top", xPosition, topPipeHeight)
-	local bottomPipe = getPipeFromPool("bottom", xPosition, bottomPipeHeight)
-	
-	-- Store as a pair (for scoring - only score once per pair)
+	local topPipe = getPipeFromPool(styleIndex, "top", xPosition, topHeight)
+	local bottomPipe = getPipeFromPool(styleIndex, "bottom", xPosition, bottomHeight)
+
 	table.insert(activePipePairs, {
 		top = topPipe,
 		bottom = bottomPipe,
 		scored = false,
 		xPosition = xPosition,
+		styleIndex = styleIndex,
 	})
+
+	return spacing
 end
 
 --[[
 	Pre-spawns pipe pairs ahead of the player for the ready state.
-	Creates multiple pipe pairs at randomized intervals.
 ]]
 function PipeManager.preSpawnPipes()
-	if not PlayerController then
-		return
-	end
-	
+	if not PlayerController then return end
+
 	local playerPos = PlayerController.getPosition()
-	if not playerPos then
-		return
-	end
-	
+	if not playerPos then return end
+
 	local playerX = playerPos.X
-	
+
 	-- Randomize first pipe pair distance
-	local firstPipeDistance = config.minFirstPipeDistance + 
-		math.random() * (config.maxFirstPipeDistance - config.minFirstPipeDistance)
-	
-	-- Set next spawn X to be ahead of the player
+	local firstPipeDistance = PipeConfig.FIRST_PIPE_MIN +
+		math.random() * (PipeConfig.FIRST_PIPE_MAX - PipeConfig.FIRST_PIPE_MIN)
+
 	nextSpawnX = playerX + firstPipeDistance
-	
-	-- Pre-spawn multiple pipe pairs with randomized spacing
-	for i = 1, config.preSpawnCount do
-		spawnPipePair(nextSpawnX)
-		nextSpawnX = nextSpawnX + getRandomSpacing()
+
+	-- Pre-spawn with speed-estimated spacing
+	local baseSpeed = PlayerConfig.BASE_FORWARD_SPEED
+	local increaseRate = GameConfig.SPEED.INCREASE_RATE
+	local maxMultiplier = GameConfig.SPEED.MAX_MULTIPLIER
+
+	for i = 1, PipeConfig.PRE_SPAWN_COUNT do
+		local distFromStart = nextSpawnX - playerX
+		local estimatedTime = distFromStart / baseSpeed
+		local estimatedMultiplier = math.min(1 + increaseRate * estimatedTime, maxMultiplier)
+
+		local spacing = spawnPipePair(nextSpawnX, estimatedMultiplier)
+		nextSpawnX = nextSpawnX + spacing
 	end
 end
 
@@ -267,57 +211,56 @@ function PipeManager.start()
 	if updateConnection then
 		updateConnection:Disconnect()
 	end
-	
+
 	updateConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not PlayerController then
-			return
-		end
-		
+		if not PlayerController then return end
+
 		local playerPos = PlayerController.getPosition()
-		if not playerPos then
-			return
-		end
-		
+		if not playerPos then return end
+
 		local playerX = playerPos.X
-		
-		-- Track distance for difficulty progression
 		totalDistanceTraveled = playerX
-		
-		-- Spawn new pipe pairs when player approaches the spawn threshold
-		local spawnThreshold = playerX + config.spawnAheadDistance
+
+		-- Spawn new pipe pairs ahead of player
+		local spawnThreshold = playerX + PipeConfig.SPAWN_AHEAD_DISTANCE
 		while nextSpawnX < spawnThreshold do
-			spawnPipePair(nextSpawnX)
-			nextSpawnX = nextSpawnX + getRandomSpacing()
+			local spacing = spawnPipePair(nextSpawnX)
+			nextSpawnX = nextSpawnX + spacing
 		end
-		
-		-- Update active pipe pairs - check for scoring and despawning
+
+		-- Check scoring and recycle old pipes
 		for i = #activePipePairs, 1, -1 do
 			local pair = activePipePairs[i]
 			local pipeX = pair.xPosition
-			
-			-- Check if pipe pair passed player (for scoring)
-			-- Score when the pipe's X is behind the player's X
+
+			-- Score when pipe passes player
 			if not pair.scored and pipeX < playerX - 2 then
 				pair.scored = true
 				if onPipePassedCallback then
 					onPipePassedCallback(pair)
 				end
 			end
-			
-			-- Recycle pipe pair if it's far behind the player
-			if pipeX < playerX - config.despawnBehindDistance then
-				-- Return pipes to pool
-				table.insert(pipePool.top, pair.top)
-				table.insert(pipePool.bottom, pair.bottom)
+
+			-- Recycle pipes far behind player
+			if pipeX < playerX - PipeConfig.DESPAWN_BEHIND_DISTANCE then
+				local si = pair.styleIndex
+
+				local topKey = poolKey(si, "top")
+				local bottomKey = poolKey(si, "bottom")
+				if not pipePools[topKey] then pipePools[topKey] = {} end
+				if not pipePools[bottomKey] then pipePools[bottomKey] = {} end
+
+				table.insert(pipePools[topKey], pair.top)
+				table.insert(pipePools[bottomKey], pair.bottom)
 				table.remove(activePipePairs, i)
-				
+
 				-- Limit pool size to prevent memory bloat
-				if #pipePool.top > 6 then
-					local oldPipe = table.remove(pipePool.top, 1)
+				if #pipePools[topKey] > PipeConfig.MAX_POOL_SIZE then
+					local oldPipe = table.remove(pipePools[topKey], 1)
 					oldPipe:destroy()
 				end
-				if #pipePool.bottom > 6 then
-					local oldPipe = table.remove(pipePool.bottom, 1)
+				if #pipePools[bottomKey] > PipeConfig.MAX_POOL_SIZE then
+					local oldPipe = table.remove(pipePools[bottomKey], 1)
 					oldPipe:destroy()
 				end
 			end
@@ -336,33 +279,27 @@ function PipeManager.stop()
 end
 
 --[[
-	Clears all active pipes.
+	Clears all active pipes and resets state.
 ]]
 function PipeManager.clear()
 	PipeManager.stop()
-	
-	-- Destroy all active pipe pairs
+
 	for _, pair in ipairs(activePipePairs) do
 		if pair.top then pair.top:destroy() end
 		if pair.bottom then pair.bottom:destroy() end
 	end
 	activePipePairs = {}
-	
-	-- Destroy all pooled pipes
-	for _, pipe in ipairs(pipePool.top) do
-		pipe:destroy()
+
+	for _, pool in pairs(pipePools) do
+		for _, pipe in ipairs(pool) do
+			pipe:destroy()
+		end
 	end
-	for _, pipe in ipairs(pipePool.bottom) do
-		pipe:destroy()
-	end
-	pipePool = {top = {}, bottom = {}}
-	
-	-- Reset state
+	pipePools = {}
+
 	nextSpawnX = 0
 	totalDistanceTraveled = 0
-	
-	-- Refresh pipe type
-	currentPipeType = PipeType.getDefault()
+	previousGapY = nil
 end
 
 --[[
@@ -374,7 +311,6 @@ end
 
 --[[
 	Gets all active pipes (for collision detection).
-	Returns a flat list of all pipe parts.
 	@return table - Array of active pipes
 ]]
 function PipeManager.getActivePipes()
@@ -387,18 +323,11 @@ function PipeManager.getActivePipes()
 end
 
 --[[
-	Sets the current pipe type.
-	@param pipeType PipeType - The pipe type to use
-]]
-function PipeManager.setPipeType(pipeType)
-	currentPipeType = pipeType
-end
-
---[[
 	Cleans up the PipeManager.
 ]]
 function PipeManager.destroy()
 	PipeManager.clear()
+	resolvedStyles = {}
 end
 
 return PipeManager

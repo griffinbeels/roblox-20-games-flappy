@@ -9,7 +9,7 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local StartButton = {}
 StartButton.__index = StartButton
@@ -35,12 +35,14 @@ function StartButton.init(callback)
 	-- Create the button part
 	buttonPart = Instance.new("Part")
 	buttonPart.Name = "FlappyBirdStartButton"
-	buttonPart.Size = Constants.START_BUTTON.SIZE
-	buttonPart.Position = Constants.START_BUTTON.POSITION
-	buttonPart.Color = Constants.START_BUTTON.COLOR
+	buttonPart.Size = GameConfig.START_BUTTON.SIZE
+	buttonPart.Position = GameConfig.START_BUTTON.POSITION
+	buttonPart.Color = GameConfig.START_BUTTON.COLOR
 	buttonPart.Material = Enum.Material.Neon
 	buttonPart.Anchored = true
-	buttonPart.CanCollide = false -- Don't block player movement
+	buttonPart.CanCollide = false
+	buttonPart.CanTouch = false
+	buttonPart.CanQuery = false
 	buttonPart.Parent = workspace
 	
 	-- Add a SurfaceGui for the text
@@ -89,7 +91,7 @@ function StartButton.init(callback)
 	proximityPrompt.ObjectText = "Arcade Machine"
 	proximityPrompt.KeyboardKeyCode = Enum.KeyCode.E
 	proximityPrompt.HoldDuration = 0 -- Instant activation
-	proximityPrompt.MaxActivationDistance = Constants.START_BUTTON.INTERACT_DISTANCE
+	proximityPrompt.MaxActivationDistance = GameConfig.START_BUTTON.INTERACT_DISTANCE
 	proximityPrompt.RequiresLineOfSight = false
 	proximityPrompt.Parent = buttonPart
 	

@@ -6,7 +6,8 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local WorldConfig = require(ReplicatedStorage.Shared.WorldConfig)
+local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
 
 local CollisionDetector = {}
 CollisionDetector.__index = CollisionDetector
@@ -25,25 +26,6 @@ function CollisionDetector.init(playerCtrl, pipeMgr)
 end
 
 --[[
-	Checks if a point is within a bounding box.
-	@param point Vector3 - Point to check
-	@param part Part - Part to check against
-	@return boolean - True if point is inside part
-]]
-local function isPointInPart(point, part)
-	local partCFrame = part.CFrame
-	local partSize = part.Size
-	
-	-- Transform point to part's local space
-	local localPoint = partCFrame:PointToObjectSpace(point)
-	
-	-- Check if point is within part bounds
-	return math.abs(localPoint.X) <= partSize.X / 2 and
-	       math.abs(localPoint.Y) <= partSize.Y / 2 and
-	       math.abs(localPoint.Z) <= partSize.Z / 2
-end
-
---[[
 	Checks for collision with the floor (ground).
 	Player dies if they touch the ground.
 	@return boolean - True if colliding with floor
@@ -58,17 +40,13 @@ local function checkFloorCollision()
 		return false
 	end
 	
-	-- Character is ~4 studs tall, HumanoidRootPart is at center
-	-- So feet are at playerY - 2
-	local characterHalfHeight = 2
-	local feetY = playerPos.Y - characterHalfHeight
-	
+	local feetY = playerPos.Y - PlayerConfig.HITBOX_HALF_HEIGHT
+
 	-- Floor top is at Y = 0 (baseplate center at -10, height 20, so top at -10 + 10 = 0)
-	local floorTopY = Constants.FLOOR.Y_POSITION + (Constants.FLOOR.HEIGHT / 2)
-	
+	local floorTopY = WorldConfig.FLOOR.Y_POSITION + (WorldConfig.FLOOR.HEIGHT / 2)
+
 	-- Player dies if their feet touch or go below the floor
-	-- Add small tolerance to ensure detection
-	return feetY <= floorTopY + 0.5
+	return feetY <= floorTopY + PlayerConfig.COLLISION_TOLERANCE
 end
 
 --[[
@@ -92,35 +70,37 @@ local function checkPipeCollision()
 		return false
 	end
 	
-	-- Character is approximately 4 studs tall and 2 studs wide
-	local characterRadius = 1.5 -- Slightly smaller than actual size for fair collision
-	
+	local radius = PlayerConfig.HITBOX_RADIUS
+	local halfH = PlayerConfig.HITBOX_HALF_HEIGHT
+	local tol = PlayerConfig.COLLISION_TOLERANCE
+
+	local playerMinX = playerPos.X - radius
+	local playerMaxX = playerPos.X + radius
+	local playerMinY = playerPos.Y - halfH
+	local playerMaxY = playerPos.Y + halfH
+	local playerMinZ = playerPos.Z - radius
+	local playerMaxZ = playerPos.Z + radius
+
 	for _, pipe in ipairs(activePipes) do
+		-- Support any object: use the hitbox part's Position/Size
+		-- This works for Part pipes, Model pipes with invisible hitbox,
+		-- or any future pipe representation that sets pipe.part
 		if pipe and pipe.part and pipe.part.Parent then
 			local pipePos = pipe.part.Position
 			local pipeSize = pipe.part.Size
-			
-			-- Simple AABB (Axis-Aligned Bounding Box) collision
-			-- Check if player bounding box overlaps pipe bounding box
-			local playerMinX = playerPos.X - characterRadius
-			local playerMaxX = playerPos.X + characterRadius
-			local playerMinY = playerPos.Y - 2 -- Feet
-			local playerMaxY = playerPos.Y + 2 -- Head
-			local playerMinZ = playerPos.Z - characterRadius
-			local playerMaxZ = playerPos.Z + characterRadius
-			
+
 			local pipeMinX = pipePos.X - pipeSize.X / 2
 			local pipeMaxX = pipePos.X + pipeSize.X / 2
 			local pipeMinY = pipePos.Y - pipeSize.Y / 2
 			local pipeMaxY = pipePos.Y + pipeSize.Y / 2
 			local pipeMinZ = pipePos.Z - pipeSize.Z / 2
 			local pipeMaxZ = pipePos.Z + pipeSize.Z / 2
-			
-			-- Check overlap on all axes
-			local overlapX = playerMaxX > pipeMinX and playerMinX < pipeMaxX
-			local overlapY = playerMaxY > pipeMinY and playerMinY < pipeMaxY
-			local overlapZ = playerMaxZ > pipeMinZ and playerMinZ < pipeMaxZ
-			
+
+			-- AABB overlap with tolerance so touching edges count as collision
+			local overlapX = playerMaxX > (pipeMinX - tol) and playerMinX < (pipeMaxX + tol)
+			local overlapY = playerMaxY > (pipeMinY - tol) and playerMinY < (pipeMaxY + tol)
+			local overlapZ = playerMaxZ > (pipeMinZ - tol) and playerMinZ < (pipeMaxZ + tol)
+
 			if overlapX and overlapY and overlapZ then
 				return true
 			end

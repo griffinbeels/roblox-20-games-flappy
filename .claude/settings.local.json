@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Roblox_Studio__run_code",
+      "WebSearch",
+      "WebFetch(domain:create.roblox.com)",
+      "WebFetch(domain:devforum.roblox.com)",
+      "Bash(find:*)",
+      "Bash(xxd:*)",
+      "Bash(awk:*)",
+      "Bash(tasklist:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "Roblox_Studio"
+  ]
+}

@@ -6,12 +6,12 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local GameState = {}
 GameState.__index = GameState
 
-local currentState = Constants.GAME.STATES.MENU
+local currentState = GameConfig.STATES.MENU
 
 --[[
 	Gets the current game state.
@@ -33,7 +33,7 @@ end
 	Resets the game state to menu.
 ]]
 function GameState.reset()
-	currentState = Constants.GAME.STATES.MENU
+	currentState = GameConfig.STATES.MENU
 end
 
 return GameState

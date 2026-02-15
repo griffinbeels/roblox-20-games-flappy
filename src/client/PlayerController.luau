@@ -9,7 +9,9 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
+local WorldConfig = require(ReplicatedStorage.Shared.WorldConfig)
+local JumpInput = require(script.Parent.JumpInput)
 local Workspace = game:GetService("Workspace")
 
 local PlayerController = {}
@@ -28,6 +30,175 @@ local SpeedManager = nil
 local lastJumpTime = 0 -- Track when last jump occurred
 local isResetting = false -- Flag to prevent double initialization during reset
 local isInputEnabled = true -- Flag to control whether player input is accepted
+local skipNextCharacterAdded = false -- Set by GameController to skip handler during managed respawns
+local armPoseConnections = {} -- Connections that maintain the flying arm pose
+local renderStepConnection = nil -- Connection for RenderStepped arm pose maintenance
+local cachedMotor6Ds = nil -- Cache of Motor6D references for the current character
+
+--[[
+	Returns a CFrame oriented for the superman flying pose at the given position.
+	Character is horizontal with head pointing +X (travel direction), belly facing down.
+	Optional tilt parameter adds pitch based on vertical velocity.
+]]
+local function getFlyingCFrame(pos, tiltRadians)
+	tiltRadians = tiltRadians or 0
+	return CFrame.lookAt(pos, pos + Vector3.new(1, 0, 0)) * CFrame.Angles(math.rad(-90) + tiltRadians, 0, 0)
+end
+
+--[[
+	Helper to find a Motor6D by name anywhere in the character.
+]]
+local function findMotor6D(name)
+	if not character then return nil end
+	for _, desc in ipairs(character:GetDescendants()) do
+		if desc:IsA("Motor6D") and desc.Name == name then
+			return desc
+		end
+	end
+	return nil
+end
+
+--[[
+	Caches Motor6D references for the current character to avoid repeated searches.
+]]
+local function cacheMotor6Ds()
+	cachedMotor6Ds = {
+		rightShoulder = findMotor6D("RightShoulder") or findMotor6D("Right Shoulder"),
+		leftShoulder = findMotor6D("LeftShoulder") or findMotor6D("Left Shoulder"),
+		rightElbow = findMotor6D("RightElbow"),
+		leftElbow = findMotor6D("LeftElbow"),
+		rightWrist = findMotor6D("RightWrist"),
+		leftWrist = findMotor6D("LeftWrist"),
+		rightHip = findMotor6D("RightHip") or findMotor6D("Right Hip"),
+		leftHip = findMotor6D("LeftHip") or findMotor6D("Left Hip"),
+		rightKnee = findMotor6D("RightKnee"),
+		leftKnee = findMotor6D("LeftKnee"),
+		rightAnkle = findMotor6D("RightAnkle"),
+		leftAnkle = findMotor6D("LeftAnkle"),
+	}
+end
+
+-- Wind flap oscillation parameters
+local FLAP_SPEED = 8         -- How fast limbs oscillate (radians/sec)
+local ARM_FLAP_ANGLE = 15    -- Max degrees arms sway side-to-side
+local ELBOW_FLAP_ANGLE = 10  -- Max degrees elbows bend in wind
+local LEG_FLAP_ANGLE = 12    -- Max degrees legs sway
+local KNEE_FLAP_ANGLE = 8    -- Max degrees knees bend in wind
+
+--[[
+	Sets joint transforms for the flying pose with wind oscillation.
+	Called every frame from RenderStepped to override the animation system.
+	Arms are raised above head, legs trail behind, and all limbs flap in the wind.
+]]
+local function setArmTransforms()
+	if not cachedMotor6Ds then return end
+
+	local t = tick()
+	-- Arms and legs use opposite phases (when arm is up, leg is down)
+	local armWave = math.sin(t * FLAP_SPEED)
+	local elbowWave = math.sin(t * FLAP_SPEED + 0.3)
+	local legWave = armWave                              -- Same direction as arms (but belly-down flips visual)
+	local kneeWave = math.sin(t * FLAP_SPEED + 0.3)     -- Match elbow phase
+
+	local armOsc = math.rad(ARM_FLAP_ANGLE) * armWave
+	local elbowOsc = math.rad(ELBOW_FLAP_ANGLE) * elbowWave
+	local legOsc = math.rad(LEG_FLAP_ANGLE) * legWave
+	local kneeOsc = math.rad(KNEE_FLAP_ANGLE) * kneeWave
+
+	-- Arms raised above head with up/down oscillation
+	if cachedMotor6Ds.rightShoulder and cachedMotor6Ds.rightShoulder.Parent then
+		cachedMotor6Ds.rightShoulder.Transform = CFrame.Angles(armOsc, 0, math.rad(-180))
+	end
+	if cachedMotor6Ds.leftShoulder and cachedMotor6Ds.leftShoulder.Parent then
+		cachedMotor6Ds.leftShoulder.Transform = CFrame.Angles(armOsc, 0, math.rad(180))
+	end
+
+	-- Elbows flex slightly in wind
+	if cachedMotor6Ds.rightElbow and cachedMotor6Ds.rightElbow.Parent then
+		cachedMotor6Ds.rightElbow.Transform = CFrame.Angles(elbowOsc, 0, 0)
+	end
+	if cachedMotor6Ds.leftElbow and cachedMotor6Ds.leftElbow.Parent then
+		cachedMotor6Ds.leftElbow.Transform = CFrame.Angles(-elbowOsc, 0, 0)
+	end
+
+	-- Wrists stay straight
+	if cachedMotor6Ds.rightWrist and cachedMotor6Ds.rightWrist.Parent then
+		cachedMotor6Ds.rightWrist.Transform = CFrame.new()
+	end
+	if cachedMotor6Ds.leftWrist and cachedMotor6Ds.leftWrist.Parent then
+		cachedMotor6Ds.leftWrist.Transform = CFrame.new()
+	end
+
+	-- Legs trail behind with up/down oscillation
+	if cachedMotor6Ds.rightHip and cachedMotor6Ds.rightHip.Parent then
+		cachedMotor6Ds.rightHip.Transform = CFrame.Angles(legOsc, 0, 0)
+	end
+	if cachedMotor6Ds.leftHip and cachedMotor6Ds.leftHip.Parent then
+		cachedMotor6Ds.leftHip.Transform = CFrame.Angles(legOsc, 0, 0)
+	end
+
+	-- Knees bend slightly in wind
+	if cachedMotor6Ds.rightKnee and cachedMotor6Ds.rightKnee.Parent then
+		cachedMotor6Ds.rightKnee.Transform = CFrame.Angles(kneeOsc, 0, 0)
+	end
+	if cachedMotor6Ds.leftKnee and cachedMotor6Ds.leftKnee.Parent then
+		cachedMotor6Ds.leftKnee.Transform = CFrame.Angles(kneeOsc, 0, 0)
+	end
+
+	-- Ankles stay neutral
+	if cachedMotor6Ds.rightAnkle and cachedMotor6Ds.rightAnkle.Parent then
+		cachedMotor6Ds.rightAnkle.Transform = CFrame.new()
+	end
+	if cachedMotor6Ds.leftAnkle and cachedMotor6Ds.leftAnkle.Parent then
+		cachedMotor6Ds.leftAnkle.Transform = CFrame.new()
+	end
+end
+
+--[[
+	Stops default animations, destroys the Animator to prevent the animation system
+	from overwriting joint transforms, and poses the character in the superman flying
+	pose: arms stretched straight above the head.
+
+	Also starts a RenderStepped loop to maintain the pose, since RenderStepped runs
+	after the animation system evaluates transforms.
+]]
+local function applyFlyingPose()
+	if not character then return end
+
+	-- Stop the Animate script so it doesn't override our pose
+	local animate = character:FindFirstChild("Animate")
+	if animate then
+		animate.Disabled = true
+	end
+
+	-- Stop all playing animation tracks and destroy the Animator
+	-- The Animator is what actually writes to Motor6D.Transform each frame,
+	-- so destroying it is the only reliable way to stop overrides.
+	if humanoid then
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+			track:Stop(0)
+		end
+		local animator = humanoid:FindFirstChildOfClass("Animator")
+		if animator then
+			animator:Destroy()
+		end
+	end
+
+	-- Cache Motor6D references
+	cacheMotor6Ds()
+
+	-- Apply the arm pose immediately
+	setArmTransforms()
+
+	-- Start a RenderStepped binding to maintain the pose.
+	-- RenderStepped fires during the render phase, AFTER any remaining animation
+	-- evaluation, so our transforms take final priority.
+	if not renderStepConnection then
+		renderStepConnection = RunService.RenderStepped:Connect(function()
+			setArmTransforms()
+		end)
+	end
+end
 
 --[[
 	Initializes the PlayerController.
@@ -96,16 +267,19 @@ function PlayerController.init()
 	bodyPosition.D = 1000
 	bodyPosition.Parent = humanoidRootPart
 	
-	-- Use BodyGyro to keep character facing forward (right direction)
+	-- Use BodyGyro to keep character in superman flying pose
 	bodyGyro = Instance.new("BodyGyro")
-	bodyGyro.MaxTorque = Vector3.new(0, 4000, 0)
-	bodyGyro.CFrame = CFrame.new(humanoidRootPart.Position, humanoidRootPart.Position + Vector3.new(1, 0, 0))
+	bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
+	bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position)
 	bodyGyro.P = 3000
 	bodyGyro.D = 500
 	bodyGyro.Parent = humanoidRootPart
-	
+
 	-- Reset to starting position immediately
 	PlayerController.reset()
+
+	-- Apply the flying arm pose
+	applyFlyingPose()
 	
 	-- Set up input for jumping (only if not already connected)
 	if jumpConnection then
@@ -114,19 +288,31 @@ function PlayerController.init()
 	end
 	jumpConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
-		if input.KeyCode == Enum.KeyCode.Space or input.UserInputType == Enum.UserInputType.Touch then
+		if JumpInput.isJump(input) then
 			PlayerController.jump()
 		end
 	end)
 	
 	-- Listen for character respawns (in case character gets destroyed)
 	localPlayer.CharacterAdded:Connect(function(newCharacter)
+		-- Skip when GameController is managing the respawn (setReadyPosition handles everything)
+		if skipNextCharacterAdded then
+			skipNextCharacterAdded = false
+			return
+		end
 		-- Skip if we're already resetting (to avoid double initialization)
 		if isResetting then
 			return
 		end
 		
 		-- Character respawned, reinitialize
+		-- Clear render step connection so applyFlyingPose creates a fresh one
+		if renderStepConnection then
+			renderStepConnection:Disconnect()
+			renderStepConnection = nil
+		end
+		cachedMotor6Ds = nil
+
 		character = newCharacter
 		humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 		humanoid = character:WaitForChild("Humanoid")
@@ -159,12 +345,12 @@ function PlayerController.init()
 		bodyPosition.Parent = humanoidRootPart
 		
 		bodyGyro = Instance.new("BodyGyro")
-		bodyGyro.MaxTorque = Vector3.new(0, 4000, 0)
-		bodyGyro.CFrame = CFrame.new(humanoidRootPart.Position, humanoidRootPart.Position + Vector3.new(1, 0, 0))
+		bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
+		bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position)
 		bodyGyro.P = 3000
 		bodyGyro.D = 500
 		bodyGyro.Parent = humanoidRootPart
-		
+
 		-- Prevent collisions but DON'T change transparency
 		-- HumanoidRootPart should remain invisible
 		for _, part in ipairs(character:GetDescendants()) do
@@ -173,12 +359,14 @@ function PlayerController.init()
 			end
 		end
 		humanoidRootPart.CanCollide = false
-		
+
+		-- Apply flying arm pose
+		applyFlyingPose()
+
 		-- Reset position
 		isResetting = true
-		local startPos = Constants.PLAYER.START_POSITION
-		local lookAtPos = startPos + Vector3.new(1, 0, 0) -- Face +X direction
-		humanoidRootPart.CFrame = CFrame.lookAt(startPos, lookAtPos)
+		local startPos = PlayerConfig.START_POSITION
+		humanoidRootPart.CFrame = getFlyingCFrame(startPos)
 		humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
 		humanoidRootPart.RotVelocity = Vector3.new(0, 0, 0)
 		currentVelocity = Vector3.new(0, 0, 0)
@@ -190,9 +378,9 @@ function PlayerController.init()
 		end
 		
 		if bodyGyro then
-			bodyGyro.CFrame = CFrame.new(startPos, startPos + Vector3.new(1, 0, 0))
+			bodyGyro.CFrame = getFlyingCFrame(startPos)
 		end
-		
+
 		isResetting = false
 	end)
 end
@@ -205,7 +393,7 @@ function PlayerController.getPosition()
 	if humanoidRootPart then
 		return humanoidRootPart.Position
 	end
-	return Constants.PLAYER.START_POSITION
+	return PlayerConfig.START_POSITION
 end
 
 --[[
@@ -220,22 +408,19 @@ function PlayerController.jump()
 	if not isInputEnabled then
 		return
 	end
-	
+
 	if not humanoidRootPart then
 		return
 	end
-	
+
 	-- Apply instant upward force (like hitting a ping pong ball)
-	-- This gives immediate upward boost, preventing the fall
-	-- The feeling is: "I'm falling, I need to tap to stay up!"
 	-- Reset Y velocity completely and apply jump force for consistent feel
-	currentVelocity = Vector3.new(currentVelocity.X, Constants.PLAYER.JUMP_FORCE, 0)
-	lastJumpTime = tick() -- Track jump time
-	
+	currentVelocity = Vector3.new(currentVelocity.X, PlayerConfig.JUMP_FORCE, 0)
+	lastJumpTime = tick()
+
 	-- Apply directly to HumanoidRootPart for immediate response
-	-- This makes the jump feel instant and responsive - like preventing a fall
-	humanoidRootPart.Velocity = Vector3.new(humanoidRootPart.Velocity.X, Constants.PLAYER.JUMP_FORCE, 0)
-	
+	humanoidRootPart.Velocity = Vector3.new(humanoidRootPart.Velocity.X, PlayerConfig.JUMP_FORCE, 0)
+
 	-- Play jump sound (optional - SoundManager may not be loaded yet)
 	local success, SoundManager = pcall(function()
 		return require(script.Parent.SoundManager)
@@ -279,7 +464,7 @@ function PlayerController.startUpdate()
 		-- Apply gravity to velocity (constant downward pull)
 		-- This creates the "falling" feeling that player must prevent with jumps
 		-- Like a ping pong ball - it falls, you tap to keep it up!
-		currentVelocity = currentVelocity - Vector3.new(0, Constants.PLAYER.GRAVITY * deltaTime, 0)
+		currentVelocity = currentVelocity - Vector3.new(0, PlayerConfig.GRAVITY * deltaTime, 0)
 		
 		-- If on ground, stop downward velocity (but jump can still work)
 		if isOnGround and currentVelocity.Y < 0 then
@@ -287,7 +472,7 @@ function PlayerController.startUpdate()
 		end
 		
 		-- Get forward speed (from SpeedManager if available, otherwise base speed)
-		local forwardSpeed = Constants.PLAYER.BASE_FORWARD_SPEED
+		local forwardSpeed = PlayerConfig.BASE_FORWARD_SPEED
 		if SpeedManager then
 			forwardSpeed = SpeedManager.getCurrentSpeed()
 		end
@@ -311,11 +496,11 @@ function PlayerController.startUpdate()
 		end
 		
 		-- Clamp Y position within boundaries
-		if targetPos.Y < Constants.BOUNDARIES.MIN_Y then
-			targetPos = Vector3.new(targetPos.X, Constants.BOUNDARIES.MIN_Y, targetPos.Z)
+		if targetPos.Y < WorldConfig.BOUNDARIES.MIN_Y then
+			targetPos = Vector3.new(targetPos.X, WorldConfig.BOUNDARIES.MIN_Y, targetPos.Z)
 			currentVelocity = Vector3.new(currentVelocity.X, math.max(0, currentVelocity.Y), 0)
-		elseif targetPos.Y > Constants.BOUNDARIES.MAX_Y then
-			targetPos = Vector3.new(targetPos.X, Constants.BOUNDARIES.MAX_Y, targetPos.Z)
+		elseif targetPos.Y > WorldConfig.BOUNDARIES.MAX_Y then
+			targetPos = Vector3.new(targetPos.X, WorldConfig.BOUNDARIES.MAX_Y, targetPos.Z)
 			currentVelocity = Vector3.new(currentVelocity.X, math.min(0, currentVelocity.Y), 0)
 		end
 		
@@ -336,12 +521,14 @@ function PlayerController.startUpdate()
 			bodyPosition.MaxForce = Vector3.new(0, 0, 0)
 		end
 		
-		-- Keep character facing forward (right direction) with BodyGyro
+		-- Keep character in superman flying pose with velocity-based tilt
 		if bodyGyro and humanoidRootPart then
-			local currentPos = humanoidRootPart.Position
-			local forwardDirection = Vector3.new(1, 0, 0) -- Face right (forward direction)
-			bodyGyro.CFrame = CFrame.new(currentPos, currentPos + forwardDirection)
+			local tilt = math.clamp(currentVelocity.Y / 200, -0.4, 0.4)
+			bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position, tilt)
+			bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
 		end
+
+		-- Arm pose is maintained by RenderStepped (see applyFlyingPose)
 	end)
 end
 
@@ -402,7 +589,7 @@ function PlayerController.reset()
 	if not bodyGyro or not bodyGyro.Parent then
 		if bodyGyro then bodyGyro:Destroy() end
 		bodyGyro = Instance.new("BodyGyro")
-		bodyGyro.MaxTorque = Vector3.new(0, 4000, 0) -- Only Y-axis rotation
+		bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
 		bodyGyro.P = 3000
 		bodyGyro.D = 500
 		bodyGyro.Parent = humanoidRootPart
@@ -434,23 +621,25 @@ function PlayerController.reset()
 	end
 	
 	-- Reset to start position using CFrame for immediate teleport
-	local startPos = Constants.PLAYER.START_POSITION
-	local lookAtPos = startPos + Vector3.new(1, 0, 0) -- Face +X direction
-	humanoidRootPart.CFrame = CFrame.lookAt(startPos, lookAtPos)
+	local startPos = PlayerConfig.START_POSITION
+	humanoidRootPart.CFrame = getFlyingCFrame(startPos)
 	humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
 	humanoidRootPart.RotVelocity = Vector3.new(0, 0, 0)
 	currentVelocity = Vector3.new(0, 0, 0)
 	lastJumpTime = 0
-	
+
 	if bodyPosition then
 		bodyPosition.Position = startPos
 		bodyPosition.MaxForce = Vector3.new(0, 0, 0) -- Disable
 	end
 	
 	if bodyGyro then
-		bodyGyro.CFrame = CFrame.new(startPos, startPos + Vector3.new(1, 0, 0))
+		bodyGyro.CFrame = getFlyingCFrame(startPos)
 	end
-	
+
+	-- Apply flying pose
+	applyFlyingPose()
+
 	-- Reset flag
 	isResetting = false
 end
@@ -459,21 +648,29 @@ end
 	Sets the player to the ready position (floating in the air).
 ]]
 function PlayerController.setReadyPosition()
-	-- Re-acquire character references - wait for character to fully load
-	character = localPlayer.Character
+	-- Use the module-level character ref (kept current by our CharacterAdded handler).
+	-- Only re-acquire from LocalPlayer if the cached ref is stale.
 	if not character or not character.Parent then
-		character = localPlayer.CharacterAdded:Wait()
+		character = localPlayer.Character
 	end
-	
-	-- Wait for essential parts to load (with timeout)
-	humanoidRootPart = character:WaitForChild("HumanoidRootPart", 10)
-	humanoid = character:WaitForChild("Humanoid", 10)
-	
+	if not character or not character.Parent then
+		-- Character truly doesn't exist yet — wait with a timeout
+		local waitThread = task.delay(10, function() end) -- safety net
+		character = localPlayer.CharacterAdded:Wait()
+		task.cancel(waitThread)
+	end
+
+	-- Refresh part references from the (possibly new) character
+	humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+		or character:WaitForChild("HumanoidRootPart", 5)
+	humanoid = character:FindFirstChild("Humanoid")
+		or character:WaitForChild("Humanoid", 5)
+
 	if not humanoidRootPart or not humanoid then
 		warn("PlayerController.setReadyPosition: Timeout waiting for character parts")
 		return
 	end
-	
+
 	-- Wait a frame for character to fully initialize
 	task.wait()
 	
@@ -498,11 +695,11 @@ function PlayerController.setReadyPosition()
 	bodyGyro.MaxTorque = Vector3.new(0, 0, 0) -- Start disabled
 	bodyGyro.Parent = humanoidRootPart
 	
-	-- Position player in the air at the ready Y position
+	-- Position player in the air at the ready position (START_POSITION + hover offset)
 	local readyPos = Vector3.new(
-		Constants.PLAYER.START_POSITION.X,
-		Constants.READY.PLAYER_Y,
-		Constants.PLAYER.START_POSITION.Z
+		PlayerConfig.START_POSITION.X,
+		PlayerConfig.START_POSITION.Y + PlayerConfig.HOVER_Y_OFFSET,
+		PlayerConfig.START_POSITION.Z
 	)
 	
 	-- Disable humanoid movement during ready state
@@ -525,10 +722,8 @@ function PlayerController.setReadyPosition()
 		end
 	end
 	
-	-- Set position facing +X direction (the direction we move)
-	-- Use CFrame.lookAt for reliable facing direction
-	local lookAtPos = readyPos + Vector3.new(1, 0, 0) -- Look toward +X
-	humanoidRootPart.CFrame = CFrame.lookAt(readyPos, lookAtPos)
+	-- Set position in superman flying pose
+	humanoidRootPart.CFrame = getFlyingCFrame(readyPos)
 	humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
 	humanoidRootPart.RotVelocity = Vector3.new(0, 0, 0)
 	humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
@@ -540,10 +735,13 @@ function PlayerController.setReadyPosition()
 	bodyPosition.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
 	bodyPosition.P = 50000
 	bodyPosition.D = 5000
-	
-	-- Set up BodyGyro to maintain facing direction
-	bodyGyro.CFrame = CFrame.lookAt(readyPos, lookAtPos)
+
+	-- Set up BodyGyro to maintain flying pose
+	bodyGyro.CFrame = getFlyingCFrame(readyPos)
 	bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+
+	-- Apply flying arm pose
+	applyFlyingPose()
 end
 
 --[[
@@ -560,21 +758,19 @@ function PlayerController.updateHover(time)
 	humanoidRootPart.RotVelocity = Vector3.new(0, 0, 0)
 	
 	-- Gentle bobbing animation
-	local baseY = Constants.READY.PLAYER_Y
-	local hoverOffset = math.sin(time * Constants.READY.HOVER_SPEED) * Constants.READY.HOVER_AMPLITUDE
+	local baseY = PlayerConfig.START_POSITION.Y + PlayerConfig.HOVER_Y_OFFSET
+	local hoverOffset = math.sin(time * PlayerConfig.HOVER_SPEED) * PlayerConfig.HOVER_AMPLITUDE
 	local hoverPos = Vector3.new(
-		Constants.PLAYER.START_POSITION.X,
+		PlayerConfig.START_POSITION.X,
 		baseY + hoverOffset,
-		Constants.PLAYER.START_POSITION.Z
+		PlayerConfig.START_POSITION.Z
 	)
 	
 	-- Update BodyPosition target
 	bodyPosition.Position = hoverPos
 	
-	-- Also directly set CFrame for smooth following
-	-- Use CFrame.lookAt to face +X direction
-	local lookAtPos = hoverPos + Vector3.new(1, 0, 0)
-	local targetCFrame = CFrame.lookAt(hoverPos, lookAtPos)
+	-- Also directly set CFrame for smooth following in flying pose
+	local targetCFrame = getFlyingCFrame(hoverPos)
 	humanoidRootPart.CFrame = humanoidRootPart.CFrame:Lerp(targetCFrame, 0.1)
 end
 
@@ -589,9 +785,9 @@ function PlayerController.disableHover()
 		bodyPosition.D = 1000
 	end
 	
-	-- Restore BodyGyro to normal rotation control
+	-- Restore BodyGyro to gameplay rotation control (all axes for flying pose)
 	if bodyGyro then
-		bodyGyro.MaxTorque = Vector3.new(0, 4000, 0) -- Only Y-axis rotation
+		bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
 	end
 	
 	-- Re-enable humanoid for gameplay (but with custom controls)
@@ -625,6 +821,15 @@ end
 ]]
 function PlayerController.enableInput()
 	isInputEnabled = true
+end
+
+--[[
+	Tells PlayerController to skip its next CharacterAdded handler.
+	Used by GameController during managed respawns so setReadyPosition()
+	isn't overwritten by the handler resetting to START_POSITION.
+]]
+function PlayerController.skipNextCharacterAdded()
+	skipNextCharacterAdded = true
 end
 
 --[[
@@ -671,7 +876,22 @@ end
 ]]
 function PlayerController.restoreNormalMovement()
 	PlayerController.stopUpdate()
-	
+
+	-- Stop the flying pose RenderStepped loop
+	if renderStepConnection then
+		renderStepConnection:Disconnect()
+		renderStepConnection = nil
+	end
+	cachedMotor6Ds = nil
+
+	-- Re-enable the Animate script so normal animations resume
+	if character then
+		local animate = character:FindFirstChild("Animate")
+		if animate then
+			animate.Disabled = false
+		end
+	end
+
 	-- Remove physics objects
 	if bodyPosition then
 		bodyPosition:Destroy()
@@ -709,21 +929,36 @@ function PlayerController.restoreNormalMovement()
 end
 
 --[[
+	Returns the player's current vertical velocity.
+	Used by GhostManager to send tilt data to other players.
+]]
+function PlayerController.getVelocityY()
+	return currentVelocity.Y
+end
+
+--[[
 	Cleans up the PlayerController.
 ]]
 function PlayerController.destroy()
 	PlayerController.stopUpdate()
-	
+
 	if jumpConnection then
 		jumpConnection:Disconnect()
 		jumpConnection = nil
 	end
-	
+
+	if renderStepConnection then
+		renderStepConnection:Disconnect()
+		renderStepConnection = nil
+	end
+
+	cachedMotor6Ds = nil
+
 	if bodyPosition then
 		bodyPosition:Destroy()
 		bodyPosition = nil
 	end
-	
+
 	if bodyGyro then
 		bodyGyro:Destroy()
 		bodyGyro = nil

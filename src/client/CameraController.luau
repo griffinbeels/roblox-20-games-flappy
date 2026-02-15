@@ -8,7 +8,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local CameraConfig = require(ReplicatedStorage.Shared.CameraConfig)
 
 local CameraController = {}
 CameraController.__index = CameraController
@@ -48,14 +48,14 @@ function CameraController.start()
 		if initialPos then
 			-- Camera position: follow player X, fixed Y and Z offset
 			local cameraPos = Vector3.new(
-				initialPos.X + Constants.CAMERA.OFFSET_X,
-				Constants.CAMERA.FIXED_Y,
-				Constants.CAMERA.OFFSET_Z
+				initialPos.X + CameraConfig.OFFSET_X,
+				CameraConfig.FIXED_Y,
+				CameraConfig.OFFSET_Z
 			)
 			-- Look at fixed Y position (never changes - no tilting when player jumps)
 			local lookAtPos = Vector3.new(
-				initialPos.X + Constants.CAMERA.OFFSET_X,
-				Constants.CAMERA.LOOK_AT_Y,
+				initialPos.X + CameraConfig.OFFSET_X,
+				CameraConfig.LOOK_AT_Y,
 				0
 			)
 			camera.CFrame = CFrame.lookAt(cameraPos, lookAtPos)
@@ -76,16 +76,16 @@ function CameraController.start()
 		
 		-- Camera position: follow player X only, fixed Y height and Z offset for side view
 		local cameraPos = Vector3.new(
-			playerPos.X + Constants.CAMERA.OFFSET_X,
-			Constants.CAMERA.FIXED_Y,
-			Constants.CAMERA.OFFSET_Z
+			playerPos.X + CameraConfig.OFFSET_X,
+			CameraConfig.FIXED_Y,
+			CameraConfig.OFFSET_Z
 		)
 		
 		-- Look at fixed Y position (camera never tilts up/down when player jumps)
 		-- This creates a true side-scrolling view
 		local lookAtPos = Vector3.new(
-			playerPos.X + Constants.CAMERA.OFFSET_X,
-			Constants.CAMERA.LOOK_AT_Y,
+			playerPos.X + CameraConfig.OFFSET_X,
+			CameraConfig.LOOK_AT_Y,
 			0
 		)
 		camera.CFrame = CFrame.lookAt(cameraPos, lookAtPos)
@@ -115,14 +115,14 @@ function CameraController.reset()
 		if playerPos then
 			-- Camera position: follow player X, fixed Y and Z offset
 			local cameraPos = Vector3.new(
-				playerPos.X + Constants.CAMERA.OFFSET_X,
-				Constants.CAMERA.FIXED_Y,
-				Constants.CAMERA.OFFSET_Z
+				playerPos.X + CameraConfig.OFFSET_X,
+				CameraConfig.FIXED_Y,
+				CameraConfig.OFFSET_Z
 			)
 			-- Look at fixed Y position (never changes - true side-scrolling)
 			local lookAtPos = Vector3.new(
-				playerPos.X + Constants.CAMERA.OFFSET_X,
-				Constants.CAMERA.LOOK_AT_Y,
+				playerPos.X + CameraConfig.OFFSET_X,
+				CameraConfig.LOOK_AT_Y,
 				0
 			)
 			camera.CFrame = CFrame.lookAt(cameraPos, lookAtPos)

@@ -5,6 +5,7 @@
 ]]
 
 local Players = game:GetService("Players")
+local JumpInput = require(script.Parent.JumpInput)
 
 local ReadyUI = {}
 ReadyUI.__index = ReadyUI
@@ -31,7 +32,7 @@ function ReadyUI.init()
 	messageLabel.Size = UDim2.new(0, 400, 0, 100)
 	messageLabel.Position = UDim2.new(0.5, -200, 0.6, 0)
 	messageLabel.BackgroundTransparency = 1
-	messageLabel.Text = "Press SPACE to Start"
+	messageLabel.Text = "Press " .. JumpInput.getKeyLabel() .. " to Start"
 	messageLabel.TextColor3 = Color3.new(1, 1, 1)
 	messageLabel.TextSize = 36
 	messageLabel.Font = Enum.Font.GothamBold

@@ -6,12 +6,13 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Constants = require(ReplicatedStorage.Shared.Constants)
+local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
+local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local SpeedManager = {}
 SpeedManager.__index = SpeedManager
 
-local speedMultiplier = Constants.SPEED.INITIAL_MULTIPLIER
+local speedMultiplier = GameConfig.SPEED.INITIAL_MULTIPLIER
 local gameStartTime = 0
 local isRunning = false
 
@@ -19,7 +20,7 @@ local isRunning = false
 	Starts the speed progression (call when game starts).
 ]]
 function SpeedManager.start()
-	speedMultiplier = Constants.SPEED.INITIAL_MULTIPLIER
+	speedMultiplier = GameConfig.SPEED.INITIAL_MULTIPLIER
 	gameStartTime = tick()
 	isRunning = true
 end
@@ -34,19 +35,19 @@ end
 --[[
 	Updates the speed multiplier based on elapsed time.
 	Should be called every frame during gameplay.
-	@param deltaTime number - Time since last frame
+	
 ]]
-function SpeedManager.update(deltaTime)
+function SpeedManager.update()
 	if not isRunning then
 		return
 	end
 	
 	local timeElapsed = tick() - gameStartTime
-	speedMultiplier = Constants.SPEED.INITIAL_MULTIPLIER + (timeElapsed * Constants.SPEED.INCREASE_RATE)
+	speedMultiplier = GameConfig.SPEED.INITIAL_MULTIPLIER + (timeElapsed * GameConfig.SPEED.INCREASE_RATE)
 	
 	-- Optional: Cap at max multiplier
-	if Constants.SPEED.MAX_MULTIPLIER and speedMultiplier > Constants.SPEED.MAX_MULTIPLIER then
-		speedMultiplier = Constants.SPEED.MAX_MULTIPLIER
+	if GameConfig.SPEED.MAX_MULTIPLIER and speedMultiplier > GameConfig.SPEED.MAX_MULTIPLIER then
+		speedMultiplier = GameConfig.SPEED.MAX_MULTIPLIER
 	end
 end
 
@@ -63,14 +64,14 @@ end
 	@return number - Current forward speed in studs per second
 ]]
 function SpeedManager.getCurrentSpeed()
-	return Constants.PLAYER.BASE_FORWARD_SPEED * speedMultiplier
+	return PlayerConfig.BASE_FORWARD_SPEED * speedMultiplier
 end
 
 --[[
 	Resets the speed to initial value.
 ]]
 function SpeedManager.reset()
-	speedMultiplier = Constants.SPEED.INITIAL_MULTIPLIER
+	speedMultiplier = GameConfig.SPEED.INITIAL_MULTIPLIER
 	gameStartTime = 0
 	isRunning = false
 end
