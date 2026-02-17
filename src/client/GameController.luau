@@ -36,8 +36,7 @@ local SpeedManager = nil
 local PipeManager = nil
 local CollisionDetector = nil
 local ParallaxBackground = nil
-local TrailManager = nil
-local GhostManager = nil
+local EffectRegistry = nil
 
 local GameController = {}
 GameController.__index = GameController
@@ -99,7 +98,7 @@ local function stopAllGameSystems()
 	if PipeManager then PipeManager.stop() end
 	if SpeedManager then SpeedManager.stop() end
 	if ParallaxBackground then ParallaxBackground.stop() end
-	if TrailManager then TrailManager.stop() end
+	if EffectRegistry then EffectRegistry.stopAll() end
 	ScoreUI.stop()
 end
 
@@ -395,17 +394,16 @@ function GameController.initGameSystems()
 	-- Initialize ParallaxBackground
 	ParallaxBackground.init(PlayerController)
 
-	-- Initialize TrailManager
-	TrailManager = require(script.Parent.TrailManager)
-	TrailManager.init()
-
-	-- Initialize GhostManager for multiplayer ghosts
-	GhostManager = require(script.Parent.GhostManager)
-	GhostManager.init()
+	-- Initialize effect registry and register all effects
+	EffectRegistry = require(script.Parent.EffectRegistry)
+	EffectRegistry.register("Trail", require(script.Parent.TrailManager))
+	EffectRegistry.register("Ghost", require(script.Parent.GhostManager))
+	EffectRegistry.register("Poof", require(script.Parent.PoofManager))
+	EffectRegistry.initAll()
 
 	-- Wire options menu ghost toggle to GhostManager
 	OptionsUI.onOptionChanged("ShowGhosts", function(enabled)
-		GhostManager.setEnabled(enabled)
+		EffectRegistry.get("Ghost").setEnabled(enabled)
 	end)
 
 	-- Set up pipe passed callback
@@ -518,8 +516,8 @@ function GameController.startReady()
 	ParallaxBackground.reset()
 	ParallaxBackground.start()
 
-	-- Reset and start trail on the current character
-	if TrailManager then TrailManager.reset() end
+	-- Reset all effects (trail, ghost, etc.) for new round
+	if EffectRegistry then EffectRegistry.resetAll() end
 
 	-- Pre-spawn pipes so they're visible during ready state
 	PipeManager.reset()
@@ -710,7 +708,7 @@ function GameController.returnToLobby()
 	if CameraController then CameraController.stop() end
 	if PipeManager then PipeManager.stop() end
 	if ParallaxBackground then ParallaxBackground.stop() end
-	if TrailManager then TrailManager.stop() end
+	if EffectRegistry then EffectRegistry.stopAll() end
 	if SpeedManager then SpeedManager.stop() end
 	ScoreUI.stop()
 	hideAllGameUI()
@@ -747,7 +745,7 @@ function GameController.reset()
 	if CameraController then CameraController.stop() end
 	if PipeManager then PipeManager.stop() end
 	if ParallaxBackground then ParallaxBackground.stop() end
-	if TrailManager then TrailManager.stop() end
+	if EffectRegistry then EffectRegistry.stopAll() end
 	if SpeedManager then SpeedManager.stop() end
 	ScoreUI.stop()
 	LeaderboardUI.hide()
@@ -782,9 +780,8 @@ function GameController.destroy()
 	StartButton.destroy()
 	OptionsUI.destroy()
 
-	-- Destroy game modules (only if loaded)
-	if GhostManager then GhostManager.destroy() end
-	if TrailManager then TrailManager.destroy() end
+	-- Destroy effects via registry, then other game modules
+	if EffectRegistry then EffectRegistry.destroyAll() end
 	if ParallaxBackground then ParallaxBackground.destroy() end
 	if PlayerController then PlayerController.destroy() end
 	if CameraController then CameraController.destroy() end

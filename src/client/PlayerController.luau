@@ -428,6 +428,14 @@ function PlayerController.jump()
 	if success and SoundManager then
 		SoundManager.playJump()
 	end
+
+	-- Spawn jump poof effect (optional - PoofManager may not be loaded yet)
+	local poofOk, PoofManager = pcall(function()
+		return require(script.Parent.PoofManager)
+	end)
+	if poofOk and PoofManager and PoofManager.onJump then
+		PoofManager.onJump(humanoidRootPart.Position, currentVelocity)
+	end
 end
 
 --[[

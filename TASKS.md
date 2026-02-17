@@ -35,19 +35,21 @@ Conventions:
   - NOTES: ONLY FOR PC. Do not do anything about this for mobile.
 
 ### Spawning / Scaling / Layout Robustness
-- [ ] T-0003: Pipe spawning works across screen sizes / aspect ratios
+- [X] T-0003: Pipe spawning works across screen sizes / aspect ratios
   - DoD: Pipes spawn and remain playable/visible on common aspect ratios (16:9, 21:9, 4:3) and typical FOV/camera setups.
   - Notes: Avoid UI/camera assumptions that break gameplay.
 
-- [ ] T-0004: Extend bottom pipes downward below the floor (prevent “floor gap” visuals)
+- [X] T-0004: Extend bottom pipes downward below the floor (prevent “floor gap” visuals)
   - DoD: Bottom pipe geometry always extends below the visible floor plane so no gaps appear, even with camera shifts.
 
-- [ ] T-0005: Fix pipe asset scaling so textures aren’t stretched
+- [x] T-0005: Fix pipe asset scaling so textures aren't stretched
   - DoD: Pipe textures/materials look correct (no stretching); scaling uses proper mesh sizes/tiling/material settings.
   - Notes: Prefer separate mesh variants or correct UV/material tiling instead of uniform scaling.
+  - Done: Replaced single-mesh pipe with composite "studs" pipe style (shaft + lip). Shaft uses tiling SmoothPlastic material that scales cleanly. Lip is a fixed-size wider cap at the gap-facing end. Config in PipeConfig.STYLE_DEFAULTS.studs and per-style inline overrides.
 
-- [ ] T-0006: Experiment with building an obstacle using studs / the original blocky Roblox vibe, rather than textures.
+- [x] T-0006: Experiment with building an obstacle using studs / the original blocky Roblox vibe, rather than textures.
     - DoD: A pipe object that is able to be scaled up and down without it looking weird. It should be split into the pipe base, and the pipe tip. The pipe base expands to make the gap positioning work, and the pipe pip is added at the end.
+    - Done: Implemented as the "studs" pipe style in Pipe.luau `_createStudsPipe()`. Composite of shaft Part + lip Part. Shaft stretches to fill height, lip stays fixed at gap-facing end. Fast resize in `setPositionAndHeight` (no object churn). Configured via PipeConfig.STYLE_DEFAULTS.studs and per-style inline overrides.
 ---
 
 ### UI/UX Scaling 

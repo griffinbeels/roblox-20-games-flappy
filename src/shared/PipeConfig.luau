@@ -27,6 +27,7 @@
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local WorldConfig = require(ReplicatedStorage.Shared.WorldConfig)
+local CameraConfig = require(ReplicatedStorage.Shared.CameraConfig)
 
 local PipeConfig = {}
 
@@ -73,25 +74,55 @@ PipeConfig.FIRST_PIPE_MAX = 55
 
 PipeConfig.WIDTH = 8               -- Pipe thickness (X and Z studs)
 PipeConfig.TOP_PIPE_EXTENSION = 30 -- Extra studs above MAX_Y so top pipes extend off-screen
+PipeConfig.BOTTOM_PIPE_EXTENSION = 30 -- Extra studs below MIN_Y so bottom pipes extend below the floor
+
+--============================================================================
+-- STYLE DEFAULTS
+-- Default visual properties for each pipe type. Styles only need to
+-- override the fields they want to change.
+--============================================================================
+
+PipeConfig.STYLE_DEFAULTS = {
+	studs = {
+		shaftColor = Color3.fromRGB(0, 180, 0),
+		lipColor = Color3.fromRGB(0, 160, 0),
+		shaftMaterial = Enum.Material.SmoothPlastic,
+		lipMaterial = Enum.Material.SmoothPlastic,
+		lipHeight = 1.5,
+		lipOverhang = 1.0,
+	},
+	part = {
+		color = Color3.fromRGB(0, 200, 0),
+		material = Enum.Material.SmoothPlastic,
+	},
+	model = {},
+}
 
 --============================================================================
 -- PIPE STYLES
--- Each pair randomly picks ONE style. Both top and bottom share it.
+-- Each pair randomly picks ONE style (weighted). Both top and bottom share it.
+-- Every style must have a `type` field: "part", "model", or "studs".
+-- All other fields override the defaults from STYLE_DEFAULTS[type].
+-- Optional `weight` field controls spawn probability (default 1).
+-- Chance = weight / sum(all weights). Higher weight = more common.
 --
 -- Part-based (simple colored block):
---   { COLOR = Color3.fromRGB(R, G, B), MATERIAL = Enum.Material.XXX }
+--   { type = "part", color = Color3.fromRGB(R, G, B), material = Enum.Material.XXX }
 --
 -- Model-based (marketplace model, auto-scaled to fit):
---   { MODEL_ASSET_ID = 123456789 }
+--   { type = "model", assetId = 123456789 }
 --   The model must be pre-loaded into ReplicatedStorage.PipeTemplates
 --   with its Name set to the asset ID string (e.g. "123456789").
+--
+-- Studs (composite shaft + lip):
+--   { type = "studs" }
+--   Override shaftColor, lipColor, shaftMaterial, lipMaterial, lipHeight,
+--   lipOverhang to customize appearance.
 --============================================================================
 
 PipeConfig.STYLES = {
-	-- { COLOR = Color3.fromRGB(0, 200, 0),   MATERIAL = Enum.Material.SmoothPlastic }, -- Green
-	{ MODEL_ASSET_ID = 103974792945275 },                                                -- Marketplace model
-	-- { COLOR = Color3.fromRGB(200, 0, 0),   MATERIAL = Enum.Material.Neon },           -- Red neon
-	-- { COLOR = Color3.fromRGB(0, 100, 255), MATERIAL = Enum.Material.Metal },          -- Blue metal
+	-- { type = "studs", weight = 10 },
+	{ type = "model", assetId = 1918080807, weight = 1 }, -- Neon Pillar
 }
 
 --============================================================================
@@ -99,9 +130,12 @@ PipeConfig.STYLES = {
 -- Controls how pipes are spawned and recycled around the player
 --============================================================================
 
+PipeConfig.ENABLED = true              -- Set to false to disable all pipe spawning
 PipeConfig.PRE_SPAWN_COUNT = 6         -- Pipe pairs pre-spawned ahead of player
-PipeConfig.SPAWN_AHEAD_DISTANCE = 120  -- Distance ahead of player to spawn (off-screen right)
-PipeConfig.DESPAWN_BEHIND_DISTANCE = 80 -- Distance behind player to recycle (off-screen left)
+PipeConfig.SPAWN_AHEAD_PADDING = 30    -- Extra studs beyond visible right edge to spawn pipes
+PipeConfig.DESPAWN_BEHIND_PADDING = 20 -- Extra studs beyond visible left edge to despawn pipes
+PipeConfig.FALLBACK_SPAWN_AHEAD = 120  -- Fallback if camera is unavailable
+PipeConfig.FALLBACK_DESPAWN_BEHIND = 80
 PipeConfig.MAX_POOL_SIZE = 6           -- Max pooled pipes per style before destroying extras
 
 --============================================================================
@@ -159,12 +193,27 @@ function PipeConfig.getSpacing(speedMultiplier)
 end
 
 --[[
-	Picks a random style index.
+	Picks a weighted-random style index.
+	Each style's `weight` field (default 1) controls its spawn probability.
 	@param styleCount number - Number of resolved styles
 	@return number - 1-based style index
 ]]
 function PipeConfig.getStyleIndex(styleCount)
-	return math.random(1, styleCount)
+	local styles = PipeConfig.STYLES
+	local totalWeight = 0
+	for i = 1, styleCount do
+		totalWeight = totalWeight + (styles[i] and styles[i].weight or 1)
+	end
+
+	local roll = math.random() * totalWeight
+	local cumulative = 0
+	for i = 1, styleCount do
+		cumulative = cumulative + (styles[i] and styles[i].weight or 1)
+		if roll <= cumulative then
+			return i
+		end
+	end
+	return styleCount
 end
 
 --[[
@@ -177,11 +226,63 @@ function PipeConfig.getPipeHeights(gapY, gapSize)
 	local topHeight = WorldConfig.BOUNDARIES.MAX_Y - (gapY + gapSize / 2)
 	local bottomHeight = (gapY - gapSize / 2) - WorldConfig.BOUNDARIES.MIN_Y
 
-	-- Ensure minimum height, then extend top pipe off-screen
+	-- Ensure minimum height, then extend pipes off-screen
 	topHeight = math.max(1, topHeight) + PipeConfig.TOP_PIPE_EXTENSION
-	bottomHeight = math.max(1, bottomHeight)
+	bottomHeight = math.max(1, bottomHeight) + PipeConfig.BOTTOM_PIPE_EXTENSION
 
 	return topHeight, bottomHeight
+end
+
+--[[
+	Computes the visible horizontal half-width at the play plane (Z=0)
+	based on the current camera's FOV and viewport aspect ratio.
+	Returns nil if the camera is not available.
+	@return number|nil - Half-width in studs from camera center to screen edge
+]]
+function PipeConfig.getVisibleHalfWidth()
+	local camera = workspace.CurrentCamera
+	if not camera then return nil end
+
+	local vFovDeg = camera.FieldOfView
+	local viewport = camera.ViewportSize
+	if viewport.X == 0 or viewport.Y == 0 then return nil end
+
+	local aspectRatio = viewport.X / viewport.Y
+	local vFovRad = math.rad(vFovDeg) / 2
+	local hFovRad = math.atan(aspectRatio * math.tan(vFovRad))
+
+	local distance = CameraConfig.OFFSET_Z -- camera distance from play plane
+	return distance * math.tan(hFovRad)
+end
+
+--[[
+	Returns the spawn-ahead distance (studs ahead of player to spawn pipes).
+	Adapts to the current screen size / aspect ratio.
+	@return number
+]]
+function PipeConfig.getSpawnAheadDistance()
+	local halfWidth = PipeConfig.getVisibleHalfWidth()
+	if not halfWidth then
+		return PipeConfig.FALLBACK_SPAWN_AHEAD
+	end
+	-- Right edge is halfWidth + camera X offset from player
+	local rightEdge = halfWidth + CameraConfig.OFFSET_X
+	return rightEdge + PipeConfig.SPAWN_AHEAD_PADDING
+end
+
+--[[
+	Returns the despawn-behind distance (studs behind player to recycle pipes).
+	Adapts to the current screen size / aspect ratio.
+	@return number
+]]
+function PipeConfig.getDespawnBehindDistance()
+	local halfWidth = PipeConfig.getVisibleHalfWidth()
+	if not halfWidth then
+		return PipeConfig.FALLBACK_DESPAWN_BEHIND
+	end
+	-- Left edge is halfWidth - camera X offset from player
+	local leftEdge = halfWidth - CameraConfig.OFFSET_X
+	return leftEdge + PipeConfig.DESPAWN_BEHIND_PADDING
 end
 
 return PipeConfig

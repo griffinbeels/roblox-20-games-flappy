@@ -27,7 +27,7 @@
 local PlayerConfig = {}
 
 -- GRAVITY: How fast the player falls
-PlayerConfig.GRAVITY = 500
+PlayerConfig.GRAVITY = 250
 
 -- Starting position in the game area
 PlayerConfig.START_POSITION = Vector3.new(0, 15, 0)
@@ -38,7 +38,7 @@ PlayerConfig.BASE_FORWARD_SPEED = 40
 -- JUMP FORCE: How much upward velocity is applied when pressing space
 -- Lower values = subtle micro-adjustments (good for precision)
 -- Higher values = big bouncy jumps (more arcade-like)
-PlayerConfig.JUMP_FORCE = 70
+PlayerConfig.JUMP_FORCE = 60
 
 -- HOVER: Pre-game ready state (player bobs in the air before Space is pressed)
 PlayerConfig.HOVER_Y_OFFSET = 13    -- Y offset above START_POSITION.Y

@@ -14,6 +14,7 @@ A side-scrolling flappy bird game built with Rojo for Roblox Studio.
 - **[Player Controller](docs/player-controller.md)** -- How player positioning, physics, and the flying animation system work. READ THIS before modifying PlayerController, animation code, or player start position.
 - **[Parallax Background](docs/parallax-background.md)** -- How the background parallax system works: natural 3D parallax, scenery tile recycling, sky backdrop, floor modes, and how to add textures. READ THIS before modifying ParallaxBackground, background layers, or scenery config.
 - **[Options UI](docs/options-ui.md)** -- How the in-game options menu works, how to add new toggles, and the ghost toggle wiring.
+- **[Effect Registry](docs/effect-registry.md)** -- How the effect system works and how to add new player effects (trail, ghost, etc.). READ THIS before adding a new visual effect.
 
 ## Configuration
 

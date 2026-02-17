@@ -61,26 +61,32 @@ function PipeManager.init(playerCtrl, speedMgr)
 	local styles = PipeConfig.STYLES
 	if not styles or #styles == 0 then
 		styles = {
-			{ COLOR = Color3.fromRGB(0, 200, 0), MATERIAL = Enum.Material.SmoothPlastic },
+			{ type = "part" },
 		}
 	end
 
 	for i, styleDef in ipairs(styles) do
-		local resolved = {
-			color = styleDef.COLOR,
-			material = styleDef.MATERIAL,
-			modelTemplate = nil,
-		}
+		local styleType = styleDef.type or "part"
 
-		local assetId = styleDef.MODEL_ASSET_ID
-		if assetId and assetId ~= "" then
+		-- Merge defaults with style overrides
+		local defaults = PipeConfig.STYLE_DEFAULTS[styleType] or {}
+		local resolved = { type = styleType }
+		for key, value in pairs(defaults) do
+			resolved[key] = value
+		end
+		for key, value in pairs(styleDef) do
+			resolved[key] = value
+		end
+
+		-- Model type: load template from ReplicatedStorage.PipeTemplates
+		if styleType == "model" and resolved.assetId then
 			local templatesFolder = ReplicatedStorage:FindFirstChild("PipeTemplates")
 			if templatesFolder then
-				local template = templatesFolder:FindFirstChild(tostring(assetId))
+				local template = templatesFolder:FindFirstChild(tostring(resolved.assetId))
 				if template then
 					resolved.modelTemplate = template
 				else
-					warn("[PipeManager] No template found in PipeTemplates for asset ID: " .. tostring(assetId))
+					warn("[PipeManager] No template found in PipeTemplates for asset ID: " .. tostring(resolved.assetId))
 				end
 			else
 				warn("[PipeManager] ReplicatedStorage.PipeTemplates folder not found")
@@ -176,6 +182,7 @@ end
 	Pre-spawns pipe pairs ahead of the player for the ready state.
 ]]
 function PipeManager.preSpawnPipes()
+	if not PipeConfig.ENABLED then return end
 	if not PlayerController then return end
 
 	local playerPos = PlayerController.getPosition()
@@ -213,6 +220,7 @@ function PipeManager.start()
 	end
 
 	updateConnection = RunService.Heartbeat:Connect(function(deltaTime)
+		if not PipeConfig.ENABLED then return end
 		if not PlayerController then return end
 
 		local playerPos = PlayerController.getPosition()
@@ -221,14 +229,16 @@ function PipeManager.start()
 		local playerX = playerPos.X
 		totalDistanceTraveled = playerX
 
-		-- Spawn new pipe pairs ahead of player
-		local spawnThreshold = playerX + PipeConfig.SPAWN_AHEAD_DISTANCE
+		-- Spawn new pipe pairs ahead of player (distance adapts to viewport)
+		local spawnAhead = PipeConfig.getSpawnAheadDistance()
+		local spawnThreshold = playerX + spawnAhead
 		while nextSpawnX < spawnThreshold do
 			local spacing = spawnPipePair(nextSpawnX)
 			nextSpawnX = nextSpawnX + spacing
 		end
 
 		-- Check scoring and recycle old pipes
+		local despawnBehind = PipeConfig.getDespawnBehindDistance()
 		for i = #activePipePairs, 1, -1 do
 			local pair = activePipePairs[i]
 			local pipeX = pair.xPosition
@@ -242,7 +252,7 @@ function PipeManager.start()
 			end
 
 			-- Recycle pipes far behind player
-			if pipeX < playerX - PipeConfig.DESPAWN_BEHIND_DISTANCE then
+			if pipeX < playerX - despawnBehind then
 				local si = pair.styleIndex
 
 				local topKey = poolKey(si, "top")

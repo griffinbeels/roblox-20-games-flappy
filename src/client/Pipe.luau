@@ -4,14 +4,18 @@
 	Individual pipe obstacle (can be top or bottom).
 	Pipes are spawned in pairs with a gap between them for the player to fly through.
 
-	Supports two modes:
-	- Part mode (default): Colored Part pipes using style color/material
-	- Model mode: Uses a marketplace model scaled to fit pipe dimensions
+	Supports three rendering types (dispatched via style.type):
+	- "part" (default): Simple colored Part
+	- "model": Marketplace model scaled to fit pipe dimensions
+	- "studs": Composite shaft + fixed-size lip at the opening
 
 	POSITIONING:
 	- Top pipe: Top edge at MAX_Y, extends downward
 	- Bottom pipe: Bottom edge at MIN_Y, extends upward
 	- Gap between them is where player flies through
+
+	All visual config comes from self.style (merged from STYLE_DEFAULTS
+	+ per-style overrides by PipeManager at init time).
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,12 +25,7 @@ local PipeConfig = require(ReplicatedStorage.Shared.PipeConfig)
 local Pipe = {}
 Pipe.__index = Pipe
 
--- Pipe dimensions (from PipeConfig)
 local PIPE_WIDTH = PipeConfig.WIDTH
-
--- Default visual fallbacks
-local DEFAULT_COLOR = Color3.fromRGB(0, 200, 0)
-local DEFAULT_MATERIAL = Enum.Material.SmoothPlastic
 
 --[[
 	Gets the bounding box size and center CFrame of a template (Model or BasePart).
@@ -36,15 +35,12 @@ local function getTemplateBounds(template)
 		local cf, size = template:GetBoundingBox()
 		return size, cf
 	else
-		-- Single BasePart (MeshPart, Part, etc.)
 		return template.Size, template.CFrame
 	end
 end
 
 --[[
 	Scales a cloned template (Model or single BasePart) to match target dimensions.
-	@param template Instance - The cloned Model or BasePart to scale
-	@param targetSize Vector3 - The desired bounding box size
 ]]
 local function scaleModelToSize(template, targetSize)
 	local modelBounds, modelCFrame = getTemplateBounds(template)
@@ -55,10 +51,8 @@ local function scaleModelToSize(template, targetSize)
 	local scaleZ = targetSize.Z / modelBounds.Z
 
 	if template:IsA("BasePart") then
-		-- Single part — just resize directly
 		template.Size = targetSize
 	else
-		-- Model with multiple descendants
 		for _, part in ipairs(template:GetDescendants()) do
 			if part:IsA("BasePart") then
 				part.Size = Vector3.new(
@@ -80,11 +74,36 @@ local function scaleModelToSize(template, targetSize)
 end
 
 --[[
+	Clones a model template and prepares all parts (anchor, disable collide/shadow).
+	@param template Instance - The source Model or BasePart to clone
+	@return Instance - The prepared clone
+]]
+local function cloneAndPrepareModel(template)
+	local clone = template:Clone()
+	clone.Name = "PipeVisual"
+
+	if clone:IsA("BasePart") then
+		clone.Anchored = true
+		clone.CanCollide = false
+		clone.CastShadow = false
+	end
+	for _, part in ipairs(clone:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+			part.CanCollide = false
+			part.CastShadow = false
+		end
+	end
+
+	return clone
+end
+
+--[[
 	Creates a new Pipe with a specific height.
 	@param orientation string - "top" or "bottom"
 	@param xPosition number - X position for the pipe
 	@param height number - Height of this specific pipe (calculated based on gap)
-	@param style table|nil - Resolved style { color, material, modelTemplate }
+	@param style table - Resolved style with `type` field and visual config
 	@return Pipe - New Pipe instance
 ]]
 function Pipe.new(orientation, xPosition, height, style)
@@ -95,16 +114,19 @@ function Pipe.new(orientation, xPosition, height, style)
 	self.xPosition = xPosition or 0
 	self.height = height or 10
 	self.hasBeenScored = false
-	self.container = nil -- Container Model for model mode
+	self.container = nil -- Container Model for model/studs mode
 	self.visualModel = nil -- The scaled visual model clone
 
-	-- Store style info
-	self.style = style or {}
-	self.modelTemplate = self.style.modelTemplate
-	self.color = self.style.color or DEFAULT_COLOR
-	self.material = self.style.material or DEFAULT_MATERIAL
+	-- Studs mode parts
+	self.shaft = nil
+	self.lip = nil
 
-	if self.modelTemplate then
+	-- All visual config lives in self.style
+	self.style = style or {}
+
+	if self.style.type == "studs" then
+		self:_createStudsPipe()
+	elseif self.style.type == "model" then
 		self:_createModelPipe()
 	else
 		self:_createPartPipe()
@@ -114,14 +136,28 @@ function Pipe.new(orientation, xPosition, height, style)
 end
 
 --[[
+	Creates the invisible hitbox Part used for collision detection.
+	Used by studs and model types (part type uses its visible Part as hitbox).
+]]
+function Pipe:_createHitbox()
+	self.part = Instance.new("Part")
+	self.part.Name = "PipeHitbox_" .. self.orientation
+	self.part.Size = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
+	self.part.Transparency = 1
+	self.part.CanCollide = false
+	self.part.Anchored = true
+	self.part.CastShadow = false
+end
+
+--[[
 	Creates a standard Part-based pipe using style color/material.
 ]]
 function Pipe:_createPartPipe()
 	self.part = Instance.new("Part")
 	self.part.Name = "Pipe_" .. self.orientation
 	self.part.Size = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
-	self.part.Color = self.color
-	self.part.Material = self.material
+	self.part.Color = self.style.color
+	self.part.Material = self.style.material
 	self.part.Anchored = true
 	self.part.CanCollide = false
 	self.part.CastShadow = false
@@ -134,45 +170,60 @@ end
 	Creates a model-based pipe with an invisible hitbox for collision.
 ]]
 function Pipe:_createModelPipe()
-	-- Create container
 	self.container = Instance.new("Model")
 	self.container.Name = "PipeModel_" .. self.orientation
 
-	-- Create invisible hitbox (collision detection uses this via self.part)
-	self.part = Instance.new("Part")
-	self.part.Name = "PipeHitbox_" .. self.orientation
-	self.part.Size = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
-	self.part.Transparency = 1
-	self.part.CanCollide = false
-	self.part.Anchored = true
-	self.part.CastShadow = false
+	self:_createHitbox()
 	self.part.Parent = self.container
 
-	-- Clone and scale the visual model
-	self.visualModel = self.modelTemplate:Clone()
-	self.visualModel.Name = "PipeVisual"
-
-	-- Anchor all parts (handle single BasePart or Model with descendants)
-	if self.visualModel:IsA("BasePart") then
-		self.visualModel.Anchored = true
-		self.visualModel.CanCollide = false
-		self.visualModel.CastShadow = false
-	end
-	for _, part in ipairs(self.visualModel:GetDescendants()) do
-		if part:IsA("BasePart") then
-			part.Anchored = true
-			part.CanCollide = false
-			part.CastShadow = false
-		end
-	end
-
-	-- Scale to match pipe dimensions
-	local targetSize = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
-	scaleModelToSize(self.visualModel, targetSize)
-
+	-- Clone, prepare, and scale the visual model
+	self.visualModel = cloneAndPrepareModel(self.style.modelTemplate)
+	scaleModelToSize(self.visualModel, Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH))
 	self.visualModel.Parent = self.container
 
-	-- Position everything
+	self:updatePosition()
+	self.container.Parent = workspace
+end
+
+--[[
+	Creates a composite studs pipe with a shaft and a lip/cap at the gap-facing end.
+	The shaft uses a tiling material so vertical stretching looks clean.
+	The lip is a fixed-size wider piece that gives the classic pipe silhouette.
+]]
+function Pipe:_createStudsPipe()
+	local lipHeight = self.style.lipHeight
+	local lipOverhang = self.style.lipOverhang
+	local lipWidth = PIPE_WIDTH + 2 * lipOverhang
+	local shaftHeight = math.max(0, self.height - lipHeight)
+
+	self.container = Instance.new("Model")
+	self.container.Name = "PipeStuds_" .. self.orientation
+
+	self:_createHitbox()
+	self.part.Parent = self.container
+
+	-- Shaft (stretchy part — fills most of the height)
+	self.shaft = Instance.new("Part")
+	self.shaft.Name = "Shaft"
+	self.shaft.Size = Vector3.new(PIPE_WIDTH, shaftHeight, PIPE_WIDTH)
+	self.shaft.Color = self.style.shaftColor
+	self.shaft.Material = self.style.shaftMaterial
+	self.shaft.Anchored = true
+	self.shaft.CanCollide = false
+	self.shaft.CastShadow = false
+	self.shaft.Parent = self.container
+
+	-- Lip (fixed-size cap at the gap-facing end)
+	self.lip = Instance.new("Part")
+	self.lip.Name = "Lip"
+	self.lip.Size = Vector3.new(lipWidth, lipHeight, lipWidth)
+	self.lip.Color = self.style.lipColor
+	self.lip.Material = self.style.lipMaterial
+	self.lip.Anchored = true
+	self.lip.CanCollide = false
+	self.lip.CastShadow = false
+	self.lip.Parent = self.container
+
 	self:updatePosition()
 	self.container.Parent = workspace
 end
@@ -185,17 +236,33 @@ function Pipe:updatePosition()
 
 	local centerY
 	if self.orientation == "top" then
-		-- Height includes TOP_PIPE_EXTENSION; anchor so bottom edge stays at the gap
-		-- and the extra height extends above MAX_Y (off-screen)
 		centerY = (WorldConfig.BOUNDARIES.MAX_Y + PipeConfig.TOP_PIPE_EXTENSION) - (self.height / 2)
-	elseif self.orientation == "bottom" then
-		centerY = WorldConfig.BOUNDARIES.MIN_Y + (self.height / 2)
+	else
+		centerY = (WorldConfig.BOUNDARIES.MIN_Y - PipeConfig.BOTTOM_PIPE_EXTENSION) + (self.height / 2)
 	end
 
 	local position = Vector3.new(self.xPosition, centerY, 0)
 	self.part.Position = position
 
-	-- Move visual to match hitbox position
+	-- Studs mode: position shaft and lip relative to pipe center
+	if self.shaft then
+		local lipHeight = self.style.lipHeight
+
+		if self.orientation == "bottom" then
+			local shaftCenterY = centerY - (lipHeight / 2)
+			local lipCenterY = centerY + (self.height / 2) - (lipHeight / 2)
+			self.shaft.Position = Vector3.new(self.xPosition, shaftCenterY, 0)
+			self.lip.Position = Vector3.new(self.xPosition, lipCenterY, 0)
+		else
+			local shaftCenterY = centerY + (lipHeight / 2)
+			local lipCenterY = centerY - (self.height / 2) + (lipHeight / 2)
+			self.shaft.Position = Vector3.new(self.xPosition, shaftCenterY, 0)
+			self.lip.Position = Vector3.new(self.xPosition, lipCenterY, 0)
+		end
+		return
+	end
+
+	-- Model mode: move visual to match hitbox position
 	if self.visualModel then
 		local _, modelCFrame = getTemplateBounds(self.visualModel)
 		local offset = position - modelCFrame.Position
@@ -212,7 +279,7 @@ function Pipe:updatePosition()
 
 		-- Flip top pipes upside down (template is assumed to be bottom-pipe orientation)
 		if self.orientation == "top" then
-			local flipRotation = CFrame.Angles(0, 0, math.pi) -- 180° around Z axis
+			local flipRotation = CFrame.Angles(0, 0, math.pi)
 			if self.visualModel:IsA("BasePart") then
 				self.visualModel.CFrame = CFrame.new(position) * flipRotation * (self.visualModel.CFrame - self.visualModel.CFrame.Position)
 			else
@@ -239,28 +306,15 @@ function Pipe:setPositionAndHeight(xPosition, height)
 		self.height = height
 		self.part.Size = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
 
-		-- Re-scale the visual model if in model mode
-		if self.visualModel then
-			-- Destroy old visual and clone fresh from template
+		-- Studs mode: resize shaft (lip stays fixed size)
+		if self.shaft then
+			local shaftHeight = math.max(0, self.height - self.style.lipHeight)
+			self.shaft.Size = Vector3.new(PIPE_WIDTH, shaftHeight, PIPE_WIDTH)
+		elseif self.visualModel then
+			-- Re-clone and scale the visual model
 			self.visualModel:Destroy()
-			self.visualModel = self.modelTemplate:Clone()
-			self.visualModel.Name = "PipeVisual"
-
-			if self.visualModel:IsA("BasePart") then
-				self.visualModel.Anchored = true
-				self.visualModel.CanCollide = false
-				self.visualModel.CastShadow = false
-			end
-			for _, part in ipairs(self.visualModel:GetDescendants()) do
-				if part:IsA("BasePart") then
-					part.Anchored = true
-					part.CanCollide = false
-					part.CastShadow = false
-				end
-			end
-
-			local targetSize = Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH)
-			scaleModelToSize(self.visualModel, targetSize)
+			self.visualModel = cloneAndPrepareModel(self.style.modelTemplate)
+			scaleModelToSize(self.visualModel, Vector3.new(PIPE_WIDTH, self.height, PIPE_WIDTH))
 			self.visualModel.Parent = self.container
 		end
 	end
@@ -269,42 +323,30 @@ end
 
 --[[
 	Gets the pipe's X position (for scoring and despawning).
-	@return number - X position
 ]]
 function Pipe:getX()
 	return self.xPosition
 end
 
---[[
-	Marks this pipe as scored.
-]]
 function Pipe:markAsScored()
 	self.hasBeenScored = true
 end
 
---[[
-	Checks if this pipe has been scored.
-	@return boolean - True if scored
-]]
 function Pipe:isScored()
 	return self.hasBeenScored
 end
 
---[[
-	Resets the scored flag.
-]]
 function Pipe:resetScored()
 	self.hasBeenScored = false
 end
 
---[[
-	Destroys the pipe.
-]]
 function Pipe:destroy()
 	if self.container then
 		self.container:Destroy()
 		self.container = nil
 		self.visualModel = nil
+		self.shaft = nil
+		self.lip = nil
 		self.part = nil
 	elseif self.part then
 		self.part:Destroy()
