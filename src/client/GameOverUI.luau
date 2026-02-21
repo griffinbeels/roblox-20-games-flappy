@@ -3,11 +3,14 @@
 
 	Flappy Bird–style Game Over screen with retro/pixel feel.
 	Shows score, high score, medal, and a PLAY button.
+	Includes a bacon total counter with count-up animation (same style as billboard CurrencyUI).
 ]]
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local CurrencyConfig = require(ReplicatedStorage.Shared.CurrencyConfig)
 local JumpInput = require(script.Parent.JumpInput)
 
 local GameOverUI = {}
@@ -17,11 +20,33 @@ local localPlayer = Players.LocalPlayer
 local screenGui = nil
 local onPlayAgainCallback = nil
 
+-- UIScale: viewport-adaptive scaling
+local UI_REFERENCE_HEIGHT = 800
+local UI_MIN_SCALE = 0.45
+local UI_MAX_SCALE = 1.2
+local uiScaleInstance = nil
+local viewportScaleConnection = nil
+
+local function updateUIScale()
+	if not uiScaleInstance then return end
+	local viewportHeight = workspace.CurrentCamera.ViewportSize.Y
+	local scale = math.clamp(viewportHeight / UI_REFERENCE_HEIGHT, UI_MIN_SCALE, UI_MAX_SCALE)
+	uiScaleInstance.Scale = scale
+end
+
 -- References for dynamic updates
 local scoreLabelValue = nil
 local bestLabelValue = nil
 local medalLabel = nil
 local newBestIndicator = nil
+local baconTotalLabel = nil
+local baconEarnedLabel = nil
+
+-- Count-up animation state
+local countUpConnection = nil
+local countUpStartTime = nil
+local countUpStartValue = nil
+local countUpEndValue = nil
 
 --============================================================================
 -- MEDAL HELPER
@@ -40,6 +65,70 @@ local function getMedal(score)
 		end
 	end
 	return nil -- no medal
+end
+
+--============================================================================
+-- COUNT-UP ANIMATION
+--============================================================================
+
+--[[
+	Cancels any in-progress count-up animation and snaps to the final value.
+]]
+local function cancelCountUp()
+	if countUpConnection then
+		countUpConnection:Disconnect()
+		countUpConnection = nil
+	end
+	-- Snap to final value if animation was in progress
+	if countUpEndValue and baconTotalLabel then
+		local uiCfg = CurrencyConfig.UI
+		baconTotalLabel.Text = string.format(uiCfg.FORMAT, uiCfg.ICON, countUpEndValue)
+	end
+	countUpStartTime = nil
+	countUpStartValue = nil
+	countUpEndValue = nil
+end
+
+--[[
+	Starts a count-up animation on the bacon total label.
+	@param startVal number - Starting value (total before this run)
+	@param endVal number - Ending value (total after this run)
+]]
+local function startCountUp(startVal, endVal)
+	cancelCountUp()
+
+	local uiCfg = CurrencyConfig.UI
+	local celCfg = CurrencyConfig.CELEBRATION
+
+	-- Show starting value immediately
+	baconTotalLabel.Text = string.format(uiCfg.FORMAT, uiCfg.ICON, startVal)
+
+	-- If nothing to animate, just show final value
+	if startVal == endVal then
+		return
+	end
+
+	countUpStartValue = startVal
+	countUpEndValue = endVal
+	countUpStartTime = tick() + celCfg.COUNT_UP_DELAY
+
+	countUpConnection = RunService.Heartbeat:Connect(function()
+		local now = tick()
+		if now < countUpStartTime then return end -- still in delay
+
+		local elapsed = now - countUpStartTime
+		local alpha = math.min(elapsed / celCfg.COUNT_UP_DURATION, 1)
+		local value = math.floor(countUpStartValue + (countUpEndValue - countUpStartValue) * alpha)
+		baconTotalLabel.Text = string.format(uiCfg.FORMAT, uiCfg.ICON, value)
+
+		if alpha >= 1 then
+			countUpConnection:Disconnect()
+			countUpConnection = nil
+			countUpStartTime = nil
+			countUpStartValue = nil
+			countUpEndValue = nil
+		end
+	end)
 end
 
 --============================================================================
@@ -89,11 +178,20 @@ function GameOverUI.init()
 	-- Container (centered column)
 	local container = Instance.new("Frame")
 	container.Name = "Container"
-	container.Size = UDim2.new(0, 340, 0, 420)
+	container.Size = UDim2.new(0, 340, 0, 440)
 	container.AnchorPoint = Vector2.new(0.5, 0.5)
 	container.Position = UDim2.new(0.5, 0, 0.5, 0)
 	container.BackgroundTransparency = 1
 	container.Parent = screenGui
+
+	-- UIScale: scales the entire container to fit any viewport size
+	uiScaleInstance = Instance.new("UIScale")
+	uiScaleInstance.Parent = container
+	updateUIScale()
+
+	viewportScaleConnection = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		updateUIScale()
+	end)
 
 	--------------------------------------------------------------------
 	-- "GAME OVER" title
@@ -138,7 +236,7 @@ function GameOverUI.init()
 	innerPanel.Parent = panel
 
 	local innerCorner = Instance.new("UICorner")
-	innerCorner.CornerRadius = UDim.new(0,  6)
+	innerCorner.CornerRadius = UDim.new(0, 6)
 	innerCorner.Parent = innerPanel
 
 	-- "SCORE" header + value
@@ -238,12 +336,47 @@ function GameOverUI.init()
 	medalLabel.Parent = medalFrame
 
 	--------------------------------------------------------------------
+	-- Bacon total counter (same style as billboard CurrencyUI)
+	--------------------------------------------------------------------
+	local uiCfg = CurrencyConfig.UI
+	local celCfg = CurrencyConfig.CELEBRATION
+	baconTotalLabel = makeLabel({
+		Name = "BaconTotal",
+		Size = UDim2.new(1, 0, 0, 30),
+		Position = UDim2.new(0, 0, 0, 270),
+		Text = "",
+		TextColor3 = uiCfg.TEXT_COLOR,
+		TextSize = celCfg.TEXT_SIZE,
+		Font = uiCfg.FONT,
+		Parent = container,
+	})
+	baconTotalLabel.TextStrokeColor3 = uiCfg.STROKE_COLOR
+	baconTotalLabel.TextStrokeTransparency = uiCfg.STROKE_TRANSPARENCY
+	baconTotalLabel.Visible = false
+
+	--------------------------------------------------------------------
+	-- Bacon earned this run (below total counter)
+	--------------------------------------------------------------------
+	local goCfg = CurrencyConfig.GAME_OVER
+	baconEarnedLabel = makeLabel({
+		Name = "BaconEarned",
+		Size = UDim2.new(1, 0, 0, 20),
+		Position = UDim2.new(0, 0, 0, 300),
+		Text = "",
+		TextColor3 = goCfg.TEXT_COLOR,
+		TextSize = goCfg.TEXT_SIZE,
+		Font = goCfg.FONT,
+		Parent = container,
+	})
+	baconEarnedLabel.Visible = false
+
+	--------------------------------------------------------------------
 	-- PLAY button
 	--------------------------------------------------------------------
 	local playButton = Instance.new("TextButton")
 	playButton.Name = "PlayButton"
 	playButton.Size = UDim2.new(1, 0, 0, 60)
-	playButton.Position = UDim2.new(0, 0, 0, 285)
+	playButton.Position = UDim2.new(0, 0, 0, 328)
 	playButton.BackgroundColor3 = Color3.fromRGB(80, 190, 60)
 	playButton.BorderSizePixel = 3
 	playButton.BorderColor3 = Color3.fromRGB(40, 100, 30)
@@ -266,7 +399,7 @@ function GameOverUI.init()
 	makeLabel({
 		Name = "Hint",
 		Size = UDim2.new(1, 0, 0, 24),
-		Position = UDim2.new(0, 0, 0, 352),
+		Position = UDim2.new(0, 0, 0, 395),
 		Text = "or press " .. JumpInput.getKeyLabel(),
 		TextColor3 = Color3.fromRGB(200, 200, 200),
 		TextSize = 14,
@@ -286,14 +419,18 @@ end
 	Shows the game over screen.
 	@param score number - Final score
 	@param personalBest number - Personal best score
+	@param baconEarned number? - Bacon earned this run (optional)
+	@param baconTotal number? - Lifetime bacon total after this run (optional)
 ]]
-function GameOverUI.show(score, personalBest)
+function GameOverUI.show(score, personalBest, baconEarned, baconTotal)
 	if not screenGui then
 		GameOverUI.init()
 	end
 
 	score = score or 0
 	personalBest = personalBest or 0
+	baconEarned = baconEarned or 0
+	baconTotal = baconTotal or 0
 
 	-- Update score
 	scoreLabelValue.Text = tostring(score)
@@ -324,6 +461,23 @@ function GameOverUI.show(score, personalBest)
 		medalLabel.Parent.BackgroundColor3 = Color3.fromRGB(60, 50, 30)
 	end
 
+	-- Bacon total counter + earned label
+	if baconTotal > 0 then
+		baconTotalLabel.Visible = true
+		startCountUp(baconTotal - baconEarned, baconTotal)
+
+		if baconEarned > 0 then
+			local goCfg = CurrencyConfig.GAME_OVER
+			baconEarnedLabel.Text = string.format(goCfg.FORMAT, baconEarned, CurrencyConfig.NAME)
+			baconEarnedLabel.Visible = true
+		else
+			baconEarnedLabel.Visible = false
+		end
+	else
+		baconTotalLabel.Visible = false
+		baconEarnedLabel.Visible = false
+	end
+
 	screenGui.Enabled = true
 end
 
@@ -336,9 +490,10 @@ function GameOverUI.setOnPlayAgain(callback)
 end
 
 --[[
-	Hides the game over screen.
+	Hides the game over screen. Cancels any running count-up animation.
 ]]
 function GameOverUI.hide()
+	cancelCountUp()
 	if screenGui then
 		screenGui.Enabled = false
 	end
@@ -348,7 +503,13 @@ end
 	Cleans up the GameOverUI.
 ]]
 function GameOverUI.destroy()
+	cancelCountUp()
 	onPlayAgainCallback = nil
+	if viewportScaleConnection then
+		viewportScaleConnection:Disconnect()
+		viewportScaleConnection = nil
+	end
+	uiScaleInstance = nil
 	if screenGui then
 		screenGui:Destroy()
 		screenGui = nil

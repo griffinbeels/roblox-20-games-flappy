@@ -27,6 +27,7 @@ local nextSpawnX = 0
 local SpeedManager = nil
 local PlayerController = nil
 local onPipePassedCallback = nil
+local onPipeSpawnedCallback = nil
 local totalDistanceTraveled = 0
 local previousGapY = nil
 
@@ -56,7 +57,15 @@ function PipeManager.init(playerCtrl, speedMgr)
 	totalDistanceTraveled = 0
 	previousGapY = nil
 
-	-- Resolve all styles from PipeConfig.STYLES
+	PipeManager.resolveStyles()
+end
+
+--[[
+	Resolves all styles from PipeConfig.STYLES into the internal resolvedStyles table.
+	Called by init() and can be called externally after PipeConfig.STYLES is swapped
+	(e.g. by the shop) to hot-reload pipe visuals.
+]]
+function PipeManager.resolveStyles()
 	resolvedStyles = {}
 	local styles = PipeConfig.STYLES
 	if not styles or #styles == 0 then
@@ -111,6 +120,14 @@ end
 ]]
 function PipeManager.setOnPipePassed(callback)
 	onPipePassedCallback = callback
+end
+
+--[[
+	Sets the callback for when a pipe pair is spawned.
+	@param callback function - Callback function(pipePair)
+]]
+function PipeManager.setOnPipeSpawned(callback)
+	onPipeSpawnedCallback = callback
 end
 
 --[[
@@ -173,7 +190,13 @@ local function spawnPipePair(xPosition, speedMultiplier)
 		scored = false,
 		xPosition = xPosition,
 		styleIndex = styleIndex,
+		gapY = gapY,
+		gapSize = gapSize,
 	})
+
+	if onPipeSpawnedCallback then
+		onPipeSpawnedCallback(activePipePairs[#activePipePairs])
+	end
 
 	return spacing
 end
@@ -184,7 +207,6 @@ end
 function PipeManager.preSpawnPipes()
 	if not PipeConfig.ENABLED then return end
 	if not PlayerController then return end
-
 	local playerPos = PlayerController.getPosition()
 	if not playerPos then return end
 

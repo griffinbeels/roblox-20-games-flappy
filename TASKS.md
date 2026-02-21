@@ -26,13 +26,13 @@ Conventions:
   - DoD: Background has at least 2 parallax layers that scroll at different speeds and look cohesive.
   - Done: Extracted all parallax config into standalone `ParallaxConfig.luau` with SKY_PRESETS, LAYER_PRESETS, FLOOR_PRESETS and a one-line active config. Added tiling Texture for sky with IMAGE_SIZE auto-aspect-ratio, FOLLOW_RATIO drift with clamping, TEXTURE_OFFSET_V. Scenery layers auto-derive HEIGHT from IMAGE_SIZE. Mesh floor has lastCenterGX early-exit. Simplified module: removed legacy Decal fallback, removed unused _speedMgr param, cached sky Y/Z. Updated docs.
 
-- [ ] T-0022: Foreground parallax layer (between camera and player)
+- [X] T-0022: Foreground parallax layer (between camera and player)
   - DoD: Foreground parallax exists and does not obscure gameplay unfairly.
 
 ### Movement Functionality
-- [ ] T-0009: Add functionality to click to jump
+- [X] T-0009: Add functionality to click to jump
   - DoD: Instead of only pressing spacebar, allow the user to be able to CLICK to jump as well.
-  - NOTES: ONLY FOR PC. Do not do anything about this for mobile.
+  - NOTES: ONLY FOR PC. Do not do anything about this for mobile. Mobile just taps.
 
 ### Spawning / Scaling / Layout Robustness
 - [X] T-0003: Pipe spawning works across screen sizes / aspect ratios
@@ -50,12 +50,19 @@ Conventions:
 - [x] T-0006: Experiment with building an obstacle using studs / the original blocky Roblox vibe, rather than textures.
     - DoD: A pipe object that is able to be scaled up and down without it looking weird. It should be split into the pipe base, and the pipe tip. The pipe base expands to make the gap positioning work, and the pipe pip is added at the end.
     - Done: Implemented as the "studs" pipe style in Pipe.luau `_createStudsPipe()`. Composite of shaft Part + lip Part. Shaft stretches to fill height, lip stays fixed at gap-facing end. Fast resize in `setPositionAndHeight` (no object churn). Configured via PipeConfig.STYLE_DEFAULTS.studs and per-style inline overrides.
+
+### Analytics and AB/Testing support
+- [x] T-1111: Add analytics support using the official Roblox APIs / analytics systems. This system should be extremely extensible and should be able to support the addition of capturing any user action / any user scenario that we want to track.
+  - Done: Created `AnalyticsConfig.luau` (shared event constants), `AnalyticsService.luau` (server: RemoteEvent listener → Roblox AnalyticsService), `Analytics.luau` (client facade). Wired into GameController at 5 key points: GameStart, PipePassed, GameOver (with progression complete/fail), PlayAgain, ReturnToLobby. Extensible: add constant to AnalyticsConfig + one `Analytics.logCustomEvent()` call. Supports custom, progression, funnel, and economy events.
+- [ ] T-1112: (Prerequisite: T-1111). Using the analytics system, keep track of the user's score per run. For each user, store a score for each run. Then, we should be able to calculate the average run per user, the average score for all users, etc. This will allow us to better fine-tune the game.
+- [ ] T-1113: (Prerequisites: T-1112). Leverage the built-in Roblox AB testing system. I want to be able to change and overwrite any of the config files that we have designed through an AB test. For example, what if user gravity was halved, and player jump power was doubled? How would this impact the user experience? I want to be able to quantify user behavior changes.
 ---
 
 ### UI/UX Scaling 
-- [ ] T-0006: Fix Leaderboard UI and implement as a physical BillboardGUI in the spawn area.
+- [x] T-0006: Fix Leaderboard UI and implement as a physical BillboardGUI in the spawn area.
     - DoD: Leaderboard scales correctly for all screen sizes; Leaderboard implemented as BillboardGUI that appears as a physical object in game.
     - Notes: This should be implemented as if it was a literal leaderboard in the world. When the player moves off screen, the leaderboard will also move off screen.
+    - Done: Replaced ScreenGui with an anchored invisible Part at (-10, 25, 0) + BillboardGui (12x15 studs). All sizing uses Scale-based UDim2, TextScaled with UITextSizeConstraint for resolution independence. Billboard config constants in GameConfig.LEADERBOARD. Cleanup in GameController.cleanupLeftoverObjects(). Makes T-0110 trivial (leave billboard enabled and camera pans it off naturally).
 - [ ] T-0007: Overhaul the game over screen. This should scale according to the player's screen size and should make sense no matter how it's viewed. 
     - DoD: Scaling works as expected for all screen sizes. The UI/UX looks clean and appealing.
 
@@ -103,6 +110,10 @@ Conventions:
   - DoD: Before obstacles spawn, the environment scrolls so it feels like motion; no pipes yet.
 
 ### Camera
+- [x] T-0119: Fix camera zoomed out on mobile devices
+  - DoD: On smaller screens (phones, tablets), the camera Z offset scales proportionally so the character isn't tiny. Desktop unchanged.
+  - Done: Added `ADAPTIVE_CAMERA`, `REFERENCE_VIEWPORT_HEIGHT`, `MIN_OFFSET_Z` to CameraConfig. Added `getAdaptiveOffsetZ()` to CameraController that scales Z based on viewport height (clamped to MIN_OFFSET_Z=30). Listens to ViewportSize changes for device rotation. Desktop 800px→Z=50 (unchanged), iPhone 414px→Z=30, iPad 620px→Z≈39.
+
 - [ ] T-0120: Make camera system customizable (offset/angle)
   - DoD: Camera offset can be tuned (e.g., shift up, reduce “from below” feeling) via a single config location.
   - Notes: Ensure this does not break pipe visibility or spawning logic.
@@ -193,11 +204,12 @@ Conventions:
     - Score increases when coins are collected (not “magical” passing).
     - Score display updates instantly and matches collected coins.
 
-- [ ] T-0502: Persist lifetime coins/points across runs
+- [x] T-0502: Persist lifetime coins/points across runs
   - DoD:
     - After each run, lifetime currency increases by coins earned that run.
     - Value persists across sessions (DataStore or equivalent).
   - Notes: Must handle save failures gracefully.
+  - Done: Implemented as "Bacon" currency system. Created `CurrencyConfig.luau` (shared constants), `CurrencyService.luau` (server DataStore persistence + remotes), `CurrencyManager.luau` (client tracking), `CurrencyUI.luau` (persistent on-screen display). Earns 1 Bacon per pipe pass, batched submission on game over, atomic DataStore writes, spend support wired for future shop. Bacon counter always visible; game over shows "+N Bacon" earned.
 
 ### Powerups
 - [ ] T-0600: Add powerups between pipes (system + 1–2 powerups)
@@ -232,14 +244,16 @@ Conventions:
     - Settings persist across sessions.
 
 ### Shop + cosmetics economy
-- [ ] T-0900: Implement shop using lifetime coins
+- [x] T-0900: Implement shop using lifetime coins
   - DoD:
     - Player can spend lifetime coins on at least 1 cosmetic item.
     - Purchases persist across sessions.
   - Examples: Pipe skin, floor skin, background theme, trail/jump effect variants, difficulty unlock.
+  - Done: Created config-driven cosmetic shop system. New files: `ShopConfig.luau` (item catalog + UI constants), `ShopService.luau` (server DataStore persistence + purchase validation), `ShopManager.luau` (client state cache + config appliers), `ShopUI.luau` (modal overlay with category tabs + item grid). Modified: `ParallaxConfig.luau` (exported presets, added setActiveTheme/setActiveFloor), `PipeConfig.luau` (added PIPE_STYLE_DEFS + setActiveStyles), `PipeManager.luau` (extracted resolveStyles), `CurrencyService.luau` (exported spend/add/getBalance), `CurrencyManager.luau` (added setLifetimeBalance), `ReadyUI.luau` (added shop cart button), `GameController.luau` (wired shop open/close + visual refresh), `init.server.luau` (init ShopService). 4 categories (trails, pipes, backgrounds, floors) with 9 initial items. Server-authoritative purchases with DataStore persistence.
 
-- [ ] T-0901: Cosmetic unlocks: trail variants and jump VFX variants
+- [x] T-0901: Cosmetic unlocks: trail variants and jump VFX variants
   - DoD: Multiple unlockable variants exist and can be equipped.
+  - Done: Covered by T-0900 shop system. Smoke trail (free default) and Rainbow trail (50 bacon) are purchasable/equippable via the shop.
 
 ### Achievements / badges
 - [ ] T-1000: Add achievements + badges for score milestones

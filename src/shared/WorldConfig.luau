@@ -17,7 +17,7 @@ WorldConfig.BOUNDARIES = {
 
 	-- MAX_Y: The ceiling level (top of play area)
 	-- This should be ABOVE the camera view so pipes look like they extend to infinity
-	MAX_Y = 50,
+	MAX_Y = 60
 }
 
 --============================================================================
@@ -25,8 +25,8 @@ WorldConfig.BOUNDARIES = {
 -- Must match the Baseplate in default.project.json
 --============================================================================
 WorldConfig.FLOOR = {
-	Y_POSITION = -100,  -- Y center of the floor part
-	HEIGHT = 200,       -- Height of floor (top surface at Y=0, extends to Y=-200)
+	Y_POSITION = -100, -- Y center of the floor collider (top surface at Y=0)
+	HEIGHT = 200,       -- Height of floor (extends from Y=0 down to Y=-200)
 }
 
 return WorldConfig

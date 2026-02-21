@@ -10,7 +10,7 @@ The parallax background system creates layered depth behind the gameplay area. I
 No per-frame scroll-speed math is needed. The only per-frame work is:
 1. Moving the sky backdrop to follow the player (so its edges never show)
 2. Recycling scenery tiles around the player's current position (so tiles are infinite)
-3. Recycling floor mesh tiles (same concept)
+3. Recycling floor tiles (mesh or part mode)
 
 ## Coordinate System
 
@@ -125,15 +125,19 @@ When `TEXTURE_ID` is not set:
 
 Two modes:
 
-**Mesh mode** (current): Tiles clones of a MeshPart from `ReplicatedStorage.FloorTemplates`. Each tile is scaled to `MESH_TILE_STUDS` (200) studs. An invisible collision Part (`FloorLayer`) follows the player for physics. Uses the same `lastCenterGX` early-exit optimization as scenery.
+**Mesh mode**: Tiles clones of a MeshPart from `ReplicatedStorage.FloorTemplates`. Each tile is scaled to `MESH_TILE_STUDS` studs and recycled around the camera.
 
-**Part mode** (fallback): A single large Part (1200 x 200 x 512 studs) that follows the player's X position. Used when `MESH_ASSET_ID` is not set or the template isn't found.
+**Part mode** (fallback): Recycles solid floor tiles around the camera (same infinite-grid model as scenery). Used when `MESH_ASSET_ID` is not set or the template isn't found.
+
+In both modes, a transparent collider (`FloorCollider`) tracks player X for stable floor raycasts/collision while visuals remain world-anchored for proper leftward motion.
 
 **Config:** `ParallaxConfig.luau` → `FLOOR_PRESETS` (pick one for `FLOOR`)
 ```lua
 FLOOR = {
     MESH_ASSET_ID = 4574421847,  -- Asset ID of MeshPart in FloorTemplates
     MESH_TILE_STUDS = 200,       -- World size of each tile
+    DEPTH = 512,                 -- Z thickness
+    TOP_OFFSET = 0,              -- Vertical tweak from top surface baseline
 }
 ```
 

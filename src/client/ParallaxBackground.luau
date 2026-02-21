@@ -27,7 +27,10 @@ local skyFixedY = 0
 local skyFixedZ = 0
 
 -- Floor state
-local floorPart = nil
+local floorCollider = nil
+local floorCenterY = 0
+local floorLayerZ = 0
+local floorDepth = 512
 local meshFloorTemplate = nil
 local meshOriginalSize = nil
 local meshWorldTileSize = 0
@@ -35,8 +38,13 @@ local meshScaledHeight = 0
 local meshTiles = {}
 local meshTilesPerSide = 0
 local meshTilesPerSideZ = 0
-local meshFloorCollider = nil
 local meshLastCenterGX = -9999
+local solidFloorTiles = {}
+local solidFloorTileWidth = 0
+local solidFloorTileHeight = 0
+local solidFloorTilesPerSide = 0
+local solidFloorLastCenterGX = -9999
+local solidFloorConfig = nil
 
 -- Scenery tile state
 local sceneryState = {}
@@ -46,12 +54,11 @@ local SKY_WIDTH = 2400
 local SKY_HEIGHT = 400
 local SKY_MAX_DRIFT = SKY_WIDTH * 0.25
 local FLOOR_WIDTH = 1200
-local FLOOR_HEIGHT = WorldConfig.FLOOR.HEIGHT
-local FLOOR_Y = WorldConfig.FLOOR.Y_POSITION
+local DEFAULT_FLOOR_HEIGHT = WorldConfig.FLOOR.HEIGHT
+local DEFAULT_FLOOR_DEPTH = 512
 
 -- Camera
 local CAMERA_Z = CameraConfig.OFFSET_Z
-local CAMERA_OFFSET_X = CameraConfig.OFFSET_X
 local BASE_VIEW_HALF_WIDTH = 70
 
 --============================================================================
@@ -80,6 +87,35 @@ end
 -- FLOOR HELPERS
 --============================================================================
 
+local function computeFloorTopY(config)
+	local topY = WorldConfig.BOUNDARIES.MIN_Y
+	if config and config.TOP_Y ~= nil then
+		topY = config.TOP_Y
+	end
+	return topY + (config and config.TOP_OFFSET or 0)
+end
+
+local function computeFloorCenterY(config, floorHeight)
+	return computeFloorTopY(config) - (floorHeight / 2)
+end
+
+local function createFloorCollider(initialX, floorHeight)
+	if floorCollider then
+		floorCollider:Destroy()
+		floorCollider = nil
+	end
+
+	floorCollider = Instance.new("Part")
+	floorCollider.Name = "FloorCollider"
+	floorCollider.Size = Vector3.new(FLOOR_WIDTH, floorHeight, floorDepth)
+	floorCollider.Position = Vector3.new(initialX, floorCenterY, floorLayerZ)
+	floorCollider.Transparency = 1
+	floorCollider.CanCollide = true
+	floorCollider.Anchored = true
+	floorCollider.CastShadow = false
+	floorCollider.Parent = workspace
+end
+
 local function loadMeshTemplate(assetId)
 	local folder = ReplicatedStorage:FindFirstChild("FloorTemplates")
 	if not folder then
@@ -105,7 +141,11 @@ local function createMeshTile(gridX, gridZ)
 	tile.CanCollide = false
 	tile.CastShadow = false
 	tile.Size = Vector3.new(meshWorldTileSize, meshScaledHeight, meshWorldTileSize)
-	tile.Position = Vector3.new(gridX * meshWorldTileSize, -(meshScaledHeight / 2), gridZ * meshWorldTileSize)
+	tile.Position = Vector3.new(
+		gridX * meshWorldTileSize,
+		floorCenterY,
+		(gridZ * meshWorldTileSize) + floorLayerZ
+	)
 	tile.Parent = workspace
 	return tile
 end
@@ -113,11 +153,12 @@ end
 local function updateMeshFloor(playerX)
 	if not meshFloorTemplate then return end
 
-	if meshFloorCollider then
-		meshFloorCollider.Position = Vector3.new(playerX, FLOOR_Y, 0)
+	if floorCollider then
+		floorCollider.Position = Vector3.new(playerX, floorCenterY, floorLayerZ)
 	end
 
-	local centerGX = math.floor(playerX / meshWorldTileSize + 0.5)
+	local viewCenterX = workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position.X or playerX
+	local centerGX = math.floor(viewCenterX / meshWorldTileSize + 0.5)
 	if centerGX == meshLastCenterGX then return end
 	meshLastCenterGX = centerGX
 
@@ -135,6 +176,62 @@ local function updateMeshFloor(playerX)
 		if not needed[key] then
 			tile:Destroy()
 			meshTiles[key] = nil
+		end
+	end
+end
+
+local function createSolidFloorTile(gridX)
+	local tile = Instance.new("Part")
+	tile.Name = "FloorLayer"
+	tile.Anchored = true
+	tile.CanCollide = false
+	tile.CastShadow = false
+	tile.Size = Vector3.new(solidFloorTileWidth, solidFloorTileHeight, floorDepth)
+	tile.Position = Vector3.new(gridX * solidFloorTileWidth, floorCenterY, floorLayerZ)
+	tile.Color = solidFloorConfig.COLOR or Color3.fromRGB(91, 91, 91)
+	tile.Material = solidFloorConfig.MATERIAL or Enum.Material.Slate
+	tile.Transparency = solidFloorConfig.TRANSPARENCY or 0
+	tile.Parent = workspace
+
+	if solidFloorConfig.TEXTURE_ID and solidFloorConfig.TEXTURE_ID ~= "" then
+		tile.Transparency = 1
+		local decal = Instance.new("Decal")
+		decal.Name = "FloorDecal"
+		decal.Face = Enum.NormalId.Back
+		decal.Texture = solidFloorConfig.TEXTURE_ID
+		decal.Color3 = solidFloorConfig.TEXTURE_COLOR or Color3.new(1, 1, 1)
+		decal.Transparency = solidFloorConfig.TEXTURE_TRANSPARENCY or 0
+		decal.Parent = tile
+	end
+
+	return tile
+end
+
+local function updateSolidFloor(playerX)
+	if not solidFloorConfig or solidFloorTileWidth <= 0 then return end
+
+	if floorCollider then
+		floorCollider.Position = Vector3.new(playerX, floorCenterY, floorLayerZ)
+	end
+
+	local viewCenterX = workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position.X or playerX
+	local centerGX = math.floor(viewCenterX / solidFloorTileWidth + 0.5)
+	if centerGX == solidFloorLastCenterGX then return end
+	solidFloorLastCenterGX = centerGX
+
+	local needed = {}
+	for gx = centerGX - solidFloorTilesPerSide, centerGX + solidFloorTilesPerSide do
+		local key = tostring(gx)
+		needed[key] = true
+		if not solidFloorTiles[key] then
+			solidFloorTiles[key] = createSolidFloorTile(gx)
+		end
+	end
+
+	for key, tile in pairs(solidFloorTiles) do
+		if not needed[key] then
+			tile:Destroy()
+			solidFloorTiles[key] = nil
 		end
 	end
 end
@@ -174,7 +271,7 @@ local function updateSceneryLayer(state, playerX)
 	local tileWidth = state.tileWidth
 	local tilesPerSide = state.tilesPerSide
 
-	local viewCenterX = playerX + CAMERA_OFFSET_X
+	local viewCenterX = workspace.CurrentCamera.CFrame.Position.X
 	local centerGX = math.floor(viewCenterX / tileWidth + 0.5)
 
 	if centerGX == state.lastCenterGX then return end
@@ -210,7 +307,9 @@ function ParallaxBackground.init(playerCtrl)
 	end
 
 	local bgConfig = ParallaxConfig.BACKGROUND or {}
-	local floorConfig = ParallaxConfig.FLOOR
+	local floorConfig = ParallaxConfig.FLOOR or {}
+	floorLayerZ = floorConfig.Z or 0
+	floorDepth = floorConfig.DEPTH or DEFAULT_FLOOR_DEPTH
 
 	-- Sky backdrop
 	skyFixedY = bgConfig.Y_CENTER or 20
@@ -279,19 +378,13 @@ function ParallaxBackground.init(playerCtrl)
 			meshWorldTileSize = floorConfig.MESH_TILE_STUDS or 200
 			local scaleXZ = meshWorldTileSize / meshOriginalSize.X
 			meshScaledHeight = meshOriginalSize.Y * scaleXZ
-			meshTilesPerSide = math.ceil(80 / meshWorldTileSize) + 1
-			meshTilesPerSideZ = math.ceil(256 / meshWorldTileSize) + 1
+			floorCenterY = computeFloorCenterY(floorConfig, meshScaledHeight)
+			meshTilesPerSide = computeTilesPerSide(floorLayerZ, meshWorldTileSize)
+			meshTilesPerSideZ = math.ceil((floorDepth * 0.5) / meshWorldTileSize) + 1
 			meshLastCenterGX = -9999
 
-			meshFloorCollider = Instance.new("Part")
-			meshFloorCollider.Name = "FloorLayer"
-			meshFloorCollider.Size = Vector3.new(FLOOR_WIDTH, FLOOR_HEIGHT, 512)
-			meshFloorCollider.Position = Vector3.new(initialX, FLOOR_Y, 0)
-			meshFloorCollider.Transparency = 1
-			meshFloorCollider.CanCollide = true
-			meshFloorCollider.Anchored = true
-			meshFloorCollider.CastShadow = false
-			meshFloorCollider.Parent = workspace
+			-- Invisible collider positioned to match mesh tile tops (physics safety net)
+			createFloorCollider(initialX, meshScaledHeight)
 
 			updateMeshFloor(initialX)
 		else
@@ -300,18 +393,34 @@ function ParallaxBackground.init(playerCtrl)
 	end
 
 	if not meshAssetId or meshAssetId == "" or not meshFloorTemplate then
-		floorPart = Instance.new("Part")
-		floorPart.Name = "FloorLayer"
-		floorPart.Size = Vector3.new(FLOOR_WIDTH, FLOOR_HEIGHT, 512)
-		floorPart.Position = Vector3.new(initialX, FLOOR_Y, 0)
-		floorPart.Color = floorConfig.COLOR or Color3.fromRGB(91, 91, 91)
-		floorPart.Material = floorConfig.MATERIAL or Enum.Material.Slate
-		floorPart.Transparency = floorConfig.TRANSPARENCY or 0
-		floorPart.Anchored = true
-		floorPart.CanCollide = true
-		floorPart.CastShadow = false
-		floorPart.Parent = workspace
+		solidFloorConfig = floorConfig
+		solidFloorTileWidth = floorConfig.TILE_WIDTH or 200
+		solidFloorTileHeight = floorConfig.HEIGHT or DEFAULT_FLOOR_HEIGHT
+		solidFloorTilesPerSide = computeTilesPerSide(floorLayerZ, solidFloorTileWidth)
+		solidFloorLastCenterGX = -9999
+		floorCenterY = computeFloorCenterY(floorConfig, solidFloorTileHeight)
+		createFloorCollider(initialX, solidFloorTileHeight)
+		updateSolidFloor(initialX)
 	end
+end
+
+function ParallaxBackground.getFloorPart()
+	if floorCollider and floorCollider.Parent then
+		return floorCollider
+	end
+
+	-- In mesh mode, return any actual tile (all share the same Y and height)
+	if meshFloorTemplate then
+		for _, tile in pairs(meshTiles) do
+			return tile
+		end
+	end
+
+	for _, tile in pairs(solidFloorTiles) do
+		return tile
+	end
+
+	return nil
 end
 
 function ParallaxBackground.start()
@@ -332,14 +441,10 @@ function ParallaxBackground.start()
 			skyPart.Position = Vector3.new(skyX, skyFixedY, skyFixedZ)
 		end
 
-		-- Floor follows player X (Part mode only)
-		if floorPart and floorPart.Parent then
-			floorPart.Position = Vector3.new(playerPos.X, FLOOR_Y, 0)
-		end
-
-		-- Mesh floor tile recycling
 		if meshFloorTemplate then
 			updateMeshFloor(playerPos.X)
+		elseif solidFloorConfig then
+			updateSolidFloor(playerPos.X)
 		end
 
 		-- Scenery tile recycling
@@ -364,11 +469,11 @@ function ParallaxBackground.reset()
 			if skyPart then
 				skyPart.Position = Vector3.new(playerPos.X, skyFixedY, skyFixedZ)
 			end
-			if floorPart then
-				floorPart.Position = Vector3.new(playerPos.X, FLOOR_Y, 0)
-			end
 			if meshFloorTemplate then
 				updateMeshFloor(playerPos.X)
+			elseif solidFloorConfig then
+				solidFloorLastCenterGX = -9999
+				updateSolidFloor(playerPos.X)
 			end
 			for _, state in ipairs(sceneryState) do
 				state.lastCenterGX = -9999
@@ -386,9 +491,9 @@ function ParallaxBackground.destroy()
 		skyPart = nil
 	end
 
-	if floorPart then
-		floorPart:Destroy()
-		floorPart = nil
+	if floorCollider then
+		floorCollider:Destroy()
+		floorCollider = nil
 	end
 
 	for key, tile in pairs(meshTiles) do
@@ -396,14 +501,19 @@ function ParallaxBackground.destroy()
 	end
 	meshTiles = {}
 
-	if meshFloorCollider then
-		meshFloorCollider:Destroy()
-		meshFloorCollider = nil
+	for key, tile in pairs(solidFloorTiles) do
+		tile:Destroy()
 	end
+	solidFloorTiles = {}
 
 	meshFloorTemplate = nil
 	meshOriginalSize = nil
 	meshLastCenterGX = -9999
+	solidFloorConfig = nil
+	solidFloorTileWidth = 0
+	solidFloorTileHeight = 0
+	solidFloorTilesPerSide = 0
+	solidFloorLastCenterGX = -9999
 
 	for _, state in ipairs(sceneryState) do
 		for _, tile in pairs(state.tiles) do

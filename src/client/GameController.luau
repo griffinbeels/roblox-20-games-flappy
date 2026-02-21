@@ -16,6 +16,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
+local CameraConfig = require(ReplicatedStorage.Shared.CameraConfig)
 local JumpInput = require(script.Parent.JumpInput)
 
 -- Hub/Lobby modules - loaded immediately (don't affect player/camera)
@@ -28,6 +29,15 @@ local ReadyUI = require(script.Parent.ReadyUI)
 local LeaderboardUI = require(script.Parent.LeaderboardUI)
 local SoundManager = require(script.Parent.SoundManager)
 local OptionsUI = require(script.Parent.OptionsUI)
+local DebugCameraUI = require(script.Parent.DebugCameraUI)
+local Analytics = require(script.Parent.Analytics)
+local AnalyticsConfig = require(ReplicatedStorage.Shared.AnalyticsConfig)
+local CurrencyManager = require(script.Parent.CurrencyManager)
+local CurrencyUI = require(script.Parent.CurrencyUI)
+local ShopManager = require(script.Parent.ShopManager)
+local ShopUI = require(script.Parent.ShopUI)
+local MissionManager = require(script.Parent.MissionManager)
+local MissionsUI = require(script.Parent.MissionsUI)
 
 -- Game modules - lazy loaded to avoid affecting hub
 local PlayerController = nil
@@ -37,6 +47,7 @@ local PipeManager = nil
 local CollisionDetector = nil
 local ParallaxBackground = nil
 local EffectRegistry = nil
+local BaconCollectible = nil
 
 local GameController = {}
 GameController.__index = GameController
@@ -61,8 +72,11 @@ local isGameOverDeath = false -- true when the game killed the humanoid (not a m
 local function hideAllGameUI()
 	GameOverUI.hide()
 	ReadyUI.hide()
-	LeaderboardUI.hide()
+	ReadyUI.hideShopButton()
+	ReadyUI.hideMissionsButton()
 	ScoreUI.hide()
+	ShopUI.hide()
+	MissionsUI.hide()
 end
 
 --[[
@@ -99,6 +113,7 @@ local function stopAllGameSystems()
 	if SpeedManager then SpeedManager.stop() end
 	if ParallaxBackground then ParallaxBackground.stop() end
 	if EffectRegistry then EffectRegistry.stopAll() end
+	if BaconCollectible then BaconCollectible.stop() end
 	ScoreUI.stop()
 end
 
@@ -108,6 +123,10 @@ end
 	MUST NOT yield — everything here is synchronous.
 ]]
 local function enterRespawnLockdown()
+	if currentState == "playing" then
+		MissionManager.reportEvent("run_abandoned")
+	end
+
 	currentState = nil
 	isRespawning = true
 	-- Disconnect Humanoid.Died so it can't re-fire on the dying character
@@ -176,10 +195,12 @@ local function cleanupLeftoverObjects()
 			string.find(obj.Name, "PipeModel_") == 1 or
 			string.find(obj.Name, "PipeHitbox_") == 1
 		local isBackground = obj.Name == "BackgroundLayer1" or obj.Name == "BackgroundLayer2"
-		local isFloor = obj.Name == "FloorLayer" or obj.Name == "FloorMeshTile"
+		local isFloor = obj.Name == "FloorLayer" or obj.Name == "FloorMeshTile" or obj.Name == "FloorCollider"
+		local isBacon = obj.Name == "BaconCollectible"
 		local isGhosts = obj.Name == "Ghosts"
+		local isLeaderboard = obj.Name == GameConfig.LEADERBOARD.PART.NAME
 
-		if isPipe or isBackground or isFloor or isGhosts then
+		if isPipe or isBackground or isFloor or isBacon or isGhosts or isLeaderboard then
 			obj:Destroy()
 		end
 	end
@@ -308,22 +329,39 @@ function GameController.init()
 	-- Clean up any leftover game objects first
 	cleanupLeftoverObjects()
 
-	-- Initialize ScoreManager early to fetch personal best
+	-- Initialize ScoreManager and CurrencyManager early to fetch persisted data.
+	-- Both use task.spawn internally to wait for server remotes without blocking,
+	-- then auto-request their initial values once connected.
 	ScoreManager.init()
-	ScoreManager.requestPersonalBest()
-	
+	CurrencyManager.init()
+	ShopManager.init()
+	MissionManager.init()
+
 	-- Initialize UI systems (but don't show them yet)
 	ScoreUI.init()
 	GameOverUI.init()
-	ReadyUI.init()
 	LeaderboardUI.init()
+	ReadyUI.init()
+	ShopUI.init()
+	MissionsUI.init()
+
+	-- Initialize CurrencyUI (shown during READY state only, above leaderboard)
+	CurrencyUI.init()
+	CurrencyUI.start()
 
 	-- Initialize options menu (always visible across all game states)
 	OptionsUI.init()
 
+	-- Initialize debug camera panel (hidden until /debugcam chat command)
+	DebugCameraUI.init()
+
 	-- Initialize the start button (needed for returning to hub later)
 	StartButton.init(function()
 		-- This callback is called when player activates the start button from hub
+		if ShopManager.waitUntilReady(3) then
+			-- Pre-apply equipped loadout so systems initialize with saved visuals.
+			ShopManager.applyAllEquipped()
+		end
 		GameController.initGameSystems()
 		GameController.startReady()
 	end)
@@ -333,6 +371,11 @@ function GameController.init()
 		-- Hide the start button since we're skipping the hub
 		StartButton.hide()
 		
+		if ShopManager.waitUntilReady(3) then
+			-- Pre-apply equipped loadout so systems initialize with saved visuals.
+			ShopManager.applyAllEquipped()
+		end
+
 		-- Initialize game systems immediately
 		GameController.initGameSystems()
 		
@@ -373,10 +416,18 @@ function GameController.initGameSystems()
 	PipeManager = require(script.Parent.PipeManager)
 	CollisionDetector = require(script.Parent.CollisionDetector)
 	ParallaxBackground = require(script.Parent.ParallaxBackground)
-	
+	BaconCollectible = require(script.Parent.BaconCollectible)
+
 	-- Initialize PlayerController (this will take over player movement)
 	PlayerController.init()
-	
+	PlayerController.setInputGuard(function()
+		return LeaderboardUI.isMouseOver()
+			or ReadyUI.isShopButtonMouseOver()
+			or ReadyUI.isMissionsButtonMouseOver()
+			or ShopUI.isOpen()
+			or MissionsUI.isOpen()
+	end)
+
 	-- Initialize SpeedManager
 	SpeedManager.reset()
 	PlayerController.setSpeedManager(SpeedManager)
@@ -391,8 +442,9 @@ function GameController.initGameSystems()
 	-- Initialize CollisionDetector
 	CollisionDetector.init(PlayerController, PipeManager)
 	
-	-- Initialize ParallaxBackground
+	-- Initialize ParallaxBackground and wire into collision detection
 	ParallaxBackground.init(PlayerController)
+	CollisionDetector.setParallaxBackground(ParallaxBackground)
 
 	-- Initialize effect registry and register all effects
 	EffectRegistry = require(script.Parent.EffectRegistry)
@@ -406,9 +458,83 @@ function GameController.initGameSystems()
 		EffectRegistry.get("Ghost").setEnabled(enabled)
 	end)
 
-	-- Set up pipe passed callback
-	PipeManager.setOnPipePassed(function(pipe)
+	-- Initialize BaconCollectible (physical bacon in pipe gaps)
+	BaconCollectible.init(PlayerController)
+
+	-- Wire fly-to-score animation target (score label position)
+	BaconCollectible.setFlyTarget(function()
+		return ScoreUI.getScoreLabelPosition()
+	end)
+	BaconCollectible.setGameSpeedScaleSource(function()
+		if SpeedManager and SpeedManager.getCurrentMultiplier then
+			return SpeedManager.getCurrentMultiplier()
+		end
+		return 1
+	end)
+
+	-- Spawn bacon when pipes spawn
+	PipeManager.setOnPipeSpawned(function(pair)
+		BaconCollectible.spawnAtGap(pair.xPosition, pair.gapY, pair.gapSize)
+	end)
+
+	-- Award currency immediately when bacon is collected
+	BaconCollectible.setOnCollected(function()
+		CurrencyManager.earnFromPipe()
+	end)
+
+	-- Increment score when fly animation completes (bacon reaches score UI)
+	BaconCollectible.setOnAnimationComplete(function()
+		if currentState ~= "playing" then return end
 		ScoreManager.increment()
+	end)
+
+	-- Wire shop button on ready screen → open shop modal
+	ReadyUI.setOnShopClick(function()
+		if MissionsUI.isOpen() then
+			MissionsUI.hide()
+		end
+		ShopUI.show()
+	end)
+
+	-- Wire missions button on ready screen -> open missions modal
+	ReadyUI.setOnMissionsClick(function()
+		if ShopUI.isOpen() then
+			ShopUI.hide()
+		end
+		MissionsUI.show()
+	end)
+
+	local function applyShopRefreshIfNeeded()
+		if currentState ~= "ready" then return end
+		if not ShopManager.needsRefresh() then return end
+
+		ShopManager.applyAllEquipped()
+
+		-- Rebuild visual systems with new config
+		ParallaxBackground.destroy()
+		ParallaxBackground.init(PlayerController)
+		CollisionDetector.setParallaxBackground(ParallaxBackground)
+		ParallaxBackground.reset()
+		ParallaxBackground.start()
+
+		if BaconCollectible then BaconCollectible.clear() end
+		PipeManager.clear()
+		PipeManager.resolveStyles()
+		PipeManager.preSpawnPipes()
+		BaconCollectible.start()
+
+		if EffectRegistry then EffectRegistry.resetAll() end
+	end
+
+	-- Wire shop close → apply equipped items + refresh game systems if dirty
+	ShopUI.setOnClose(function()
+		applyShopRefreshIfNeeded()
+	end)
+
+	-- Ensure saved equipped loadout is applied as soon as initial shop data arrives.
+	ShopManager.onReady(function()
+		if ShopUI.isOpen() or MissionsUI.isOpen() then return end
+		applyShopRefreshIfNeeded()
 	end)
 
 	-- Handle manual respawn (player clicks "Reset Character" in Roblox menu).
@@ -467,6 +593,7 @@ function GameController.initGameSystems()
 		task.wait(0.1)
 
 		-- Clean up game data
+		if BaconCollectible then BaconCollectible.clear() end
 		if PipeManager then PipeManager.clear() end
 		if SpeedManager then SpeedManager.reset() end
 		ScoreManager.reset()
@@ -505,6 +632,9 @@ function GameController.startReady()
 	currentState = "ready"
 	GameState.setState(GameConfig.STATES.READY)
 
+	-- Apply equipped shop items (ensures visuals match on first game and every round)
+	ShopManager.applyAllEquipped()
+
 	-- Position player in the air at ready position
 	PlayerController.setReadyPosition()
 
@@ -523,9 +653,15 @@ function GameController.startReady()
 	PipeManager.reset()
 	PipeManager.preSpawnPipes()
 
+	-- Start bacon collectible system (bacons already spawned via onPipeSpawned)
+	BaconCollectible.start()
+
 	-- Show ready UI
 	ReadyUI.show()
 	LeaderboardUI.show()
+	ReadyUI.showShopButton()
+	ReadyUI.showMissionsButton()
+	CurrencyUI.show()
 
 	-- Start hover animation for player
 	local hoverTime = 0
@@ -540,17 +676,45 @@ function GameController.startReady()
 		if currentState ~= "ready" then return end
 		-- Block input while a manual respawn is in progress
 		if isRespawning then return end
+		-- Block input while shop or missions modal is open
+		if ShopUI.isOpen() or MissionsUI.isOpen() then return end
+
+		-- Open shop or missions directly on pointer input over their buttons.
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if ReadyUI.isShopButtonMouseOver() then
+				if MissionsUI.isOpen() then
+					MissionsUI.hide()
+				end
+				ShopUI.show()
+				return
+			end
+			if ReadyUI.isMissionsButtonMouseOver() then
+				if ShopUI.isOpen() then
+					ShopUI.hide()
+				end
+				MissionsUI.show()
+				return
+			end
+		end
 
 		if not JumpInput.isJump(input) then return end
 		if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA then
 			if UserInputService:GetFocusedTextBox() then return end
-		elseif input.UserInputType == Enum.UserInputType.Touch then
-			if gameProcessed then return end
+		elseif input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if gameProcessed
+				or LeaderboardUI.isMouseOver()
+				or ReadyUI.isShopButtonMouseOver()
+				or ReadyUI.isMissionsButtonMouseOver() then
+				return
+			end
 		end
 
 		-- Hide ready UI and start playing
 		ReadyUI.hide()
-		LeaderboardUI.hide()
+		ShopUI.hide()
+		MissionsUI.hide()
 		GameController.startGame()
 
 		-- Trigger the first jump immediately
@@ -570,6 +734,16 @@ function GameController.startGame()
 
 	currentState = "playing"
 	GameState.setState(GameConfig.STATES.PLAYING)
+	MissionManager.reportEvent("run_started")
+	ShopUI.hide()
+	MissionsUI.hide()
+
+	-- Analytics: track game start + progression begin
+	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.GAME_START)
+	Analytics.logProgressionStart(AnalyticsConfig.PROGRESSION.RUN)
+
+	-- Transition camera to gameplay framing (player further left on screen)
+	CameraController.setTargetScreenX(CameraConfig.PLAYER_SCREEN_X_PLAYING)
 
 	-- Disable the hover hold - player will now be affected by gravity
 	PlayerController.disableHover()
@@ -578,6 +752,7 @@ function GameController.startGame()
 	SpeedManager.reset()
 	SpeedManager.start()
 	ScoreManager.reset()
+	CurrencyManager.resetPending()
 
 	-- Start all update loops
 	-- Pipes are already spawned, just start the update loop
@@ -613,6 +788,29 @@ function GameController.gameOver()
 
 	currentState = "gameOver"
 	GameState.setState(GameConfig.STATES.GAME_OVER)
+	ShopUI.hide()
+	MissionsUI.hide()
+
+	-- Resolve any collected bacon whose fly animation has not finished yet.
+	-- This keeps final score in sync with collected bacon even on death frames.
+	local pendingBaconScore = 0
+	if BaconCollectible and BaconCollectible.consumePendingAnimationCount then
+		pendingBaconScore = BaconCollectible.consumePendingAnimationCount()
+	end
+	for _ = 1, pendingBaconScore do
+		ScoreManager.increment(false)
+	end
+
+	-- Analytics: track game over + progression result
+	local finalScore = ScoreManager.getScore()
+	MissionManager.reportEvent("run_finished", { score = finalScore })
+	local currentSpeed = SpeedManager and SpeedManager.getCurrentSpeed and SpeedManager.getCurrentSpeed() or nil
+	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.GAME_OVER, finalScore, { speed = currentSpeed })
+	if finalScore > 0 then
+		Analytics.logProgressionComplete(AnalyticsConfig.PROGRESSION.RUN, nil, finalScore)
+	else
+		Analytics.logProgressionFail(AnalyticsConfig.PROGRESSION.RUN, nil, finalScore)
+	end
 
 	-- Play death sound
 	SoundManager.playDeath()
@@ -642,14 +840,16 @@ function GameController.gameOver()
 	ScoreUI.stop()
 	ScoreUI.hide()
 
-	-- Hide leaderboard if visible
-	LeaderboardUI.hide()
-
 	-- Submit final score to server for persistence (saves if new high score)
 	ScoreManager.submitFinalScore()
 
+	-- Submit currency earned this run to server
+	local baconEarned = CurrencyManager.getPendingEarned()
+	local baconTotal = CurrencyManager.getDisplayBalance()
+	CurrencyManager.submitEarnings()
+
 	-- Show game over screen (personalBest is already tracked locally)
-	GameOverUI.show(ScoreManager.getScore(), ScoreManager.getPersonalBest())
+	GameOverUI.show(ScoreManager.getScore(), ScoreManager.getPersonalBest(), baconEarned, baconTotal)
 
 	-- Wait before allowing restart
 	task.wait(GameConfig.RESET_DELAY)
@@ -663,6 +863,8 @@ function GameController.gameOver()
 		if currentState ~= "gameOver" then return end
 		-- Block play-again while a manual respawn is in progress
 		if isRespawning then return end
+
+		Analytics.logCustomEvent(AnalyticsConfig.EVENTS.PLAY_AGAIN)
 
 		-- Prevent re-triggering (disconnect Space key, etc.)
 		disconnectAll()
@@ -686,8 +888,14 @@ function GameController.gameOver()
 		if not JumpInput.isJump(input) then return end
 		if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA then
 			if UserInputService:GetFocusedTextBox() then return end
-		elseif input.UserInputType == Enum.UserInputType.Touch then
-			if gameProcessed then return end
+		elseif input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if gameProcessed
+				or LeaderboardUI.isMouseOver()
+				or ReadyUI.isShopButtonMouseOver()
+				or ReadyUI.isMissionsButtonMouseOver() then
+				return
+			end
 		end
 
 		handlePlayAgain()
@@ -699,6 +907,7 @@ end
 	Restores default Roblox behavior for hub area.
 ]]
 function GameController.returnToLobby()
+	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.RETURN_TO_LOBBY)
 	disconnectAll()
 	currentState = "menu"
 	GameState.setState(GameConfig.STATES.MENU)
@@ -713,7 +922,8 @@ function GameController.returnToLobby()
 	ScoreUI.stop()
 	hideAllGameUI()
 
-	-- Clear pipes
+	-- Clear pipes and bacons
+	if BaconCollectible then BaconCollectible.clear() end
 	if PipeManager then PipeManager.clear() end
 
 	-- Restore normal player movement
@@ -748,11 +958,11 @@ function GameController.reset()
 	if EffectRegistry then EffectRegistry.stopAll() end
 	if SpeedManager then SpeedManager.stop() end
 	ScoreUI.stop()
-	LeaderboardUI.hide()
 
 	-- Reset all systems (only if loaded)
 	if PlayerController then PlayerController.reset() end
 	if SpeedManager then SpeedManager.reset() end
+	if BaconCollectible then BaconCollectible.clear() end
 	if PipeManager then PipeManager.clear() end
 	ScoreManager.reset()
 	if CameraController then CameraController.reset() end
@@ -777,11 +987,16 @@ function GameController.destroy()
 	GameOverUI.destroy()
 	ReadyUI.destroy()
 	LeaderboardUI.destroy()
+	CurrencyUI.destroy()
+	ShopUI.destroy()
+	MissionsUI.destroy()
 	StartButton.destroy()
 	OptionsUI.destroy()
+	DebugCameraUI.destroy()
 
 	-- Destroy effects via registry, then other game modules
 	if EffectRegistry then EffectRegistry.destroyAll() end
+	if BaconCollectible then BaconCollectible.destroy() end
 	if ParallaxBackground then ParallaxBackground.destroy() end
 	if PlayerController then PlayerController.destroy() end
 	if CameraController then CameraController.destroy() end

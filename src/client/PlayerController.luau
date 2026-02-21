@@ -30,6 +30,7 @@ local SpeedManager = nil
 local lastJumpTime = 0 -- Track when last jump occurred
 local isResetting = false -- Flag to prevent double initialization during reset
 local isInputEnabled = true -- Flag to control whether player input is accepted
+local inputGuardCallback = nil -- Optional callback; if it returns true, mouse/touch jump is blocked
 local skipNextCharacterAdded = false -- Set by GameController to skip handler during managed respawns
 local armPoseConnections = {} -- Connections that maintain the flying arm pose
 local renderStepConnection = nil -- Connection for RenderStepped arm pose maintenance
@@ -43,6 +44,10 @@ local cachedMotor6Ds = nil -- Cache of Motor6D references for the current charac
 local function getFlyingCFrame(pos, tiltRadians)
 	tiltRadians = tiltRadians or 0
 	return CFrame.lookAt(pos, pos + Vector3.new(1, 0, 0)) * CFrame.Angles(math.rad(-90) + tiltRadians, 0, 0)
+end
+
+local function getReadyX()
+	return PlayerConfig.START_POSITION.X + (PlayerConfig.READY_X_OFFSET or 0)
 end
 
 --[[
@@ -288,11 +293,15 @@ function PlayerController.init()
 	end
 	jumpConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
-		if JumpInput.isJump(input) then
-			PlayerController.jump()
+		if not JumpInput.isJump(input) then return end
+		-- For mouse/touch, check the external UI guard (e.g. leaderboard hover)
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if inputGuardCallback and inputGuardCallback() then return end
 		end
+		PlayerController.jump()
 	end)
-	
+
 	-- Listen for character respawns (in case character gets destroyed)
 	localPlayer.CharacterAdded:Connect(function(newCharacter)
 		-- Skip when GameController is managing the respawn (setReadyPosition handles everything)
@@ -529,10 +538,24 @@ function PlayerController.startUpdate()
 			bodyPosition.MaxForce = Vector3.new(0, 0, 0)
 		end
 		
-		-- Keep character in superman flying pose with velocity-based tilt
-		if bodyGyro and humanoidRootPart then
-			local tilt = math.clamp(currentVelocity.Y / 200, -0.4, 0.4)
-			bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position, tilt)
+		-- Orient character along trajectory based on TILT_MODE
+		if humanoidRootPart and PlayerConfig.TILT_MODE ~= "NONE" then
+			local tilt = math.atan2(currentVelocity.Y * PlayerConfig.TILT_SHARPNESS, currentVelocity.X)
+			if PlayerConfig.TILT_MODE == "DIRECT" then
+				humanoidRootPart.CFrame = getFlyingCFrame(humanoidRootPart.Position, tilt)
+				if bodyGyro then
+					bodyGyro.CFrame = humanoidRootPart.CFrame
+				end
+			elseif PlayerConfig.TILT_MODE == "DAMPED" then
+				if bodyGyro then
+					bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position, tilt)
+					bodyGyro.P = PlayerConfig.TILT_DAMPED_P
+					bodyGyro.D = PlayerConfig.TILT_DAMPED_D
+					bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
+				end
+			end
+		elseif humanoidRootPart and bodyGyro then
+			bodyGyro.CFrame = getFlyingCFrame(humanoidRootPart.Position)
 			bodyGyro.MaxTorque = Vector3.new(40000, 40000, 40000)
 		end
 
@@ -705,7 +728,7 @@ function PlayerController.setReadyPosition()
 	
 	-- Position player in the air at the ready position (START_POSITION + hover offset)
 	local readyPos = Vector3.new(
-		PlayerConfig.START_POSITION.X,
+		getReadyX(),
 		PlayerConfig.START_POSITION.Y + PlayerConfig.HOVER_Y_OFFSET,
 		PlayerConfig.START_POSITION.Z
 	)
@@ -715,21 +738,26 @@ function PlayerController.setReadyPosition()
 	humanoid.JumpPower = 0
 	humanoid.PlatformStand = true -- This prevents humanoid from applying forces
 	
-	-- Disable humanoid states that could interfere
+	-- Disable ALL humanoid states that could interfere (must match init() list
+	-- plus Running states — GettingUp/Landed can force the character upright)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Flying, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Landed, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, false)
-	
+
 	-- Make character parts non-collidable (we handle collisions manually)
 	for _, part in ipairs(character:GetDescendants()) do
 		if part:IsA("BasePart") then
 			part.CanCollide = false
 		end
 	end
-	
+
 	-- Set position in superman flying pose
 	humanoidRootPart.CFrame = getFlyingCFrame(readyPos)
 	humanoidRootPart.Velocity = Vector3.new(0, 0, 0)
@@ -747,6 +775,16 @@ function PlayerController.setReadyPosition()
 	-- Set up BodyGyro to maintain flying pose
 	bodyGyro.CFrame = getFlyingCFrame(readyPos)
 	bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+
+	-- Clean up stale renderStepConnection from previous character so
+	-- applyFlyingPose() creates a fresh one bound to the new Motor6Ds.
+	-- (When skipNextCharacterAdded was used, the normal cleanup in
+	-- PlayerController.CharacterAdded was skipped.)
+	if renderStepConnection then
+		renderStepConnection:Disconnect()
+		renderStepConnection = nil
+	end
+	cachedMotor6Ds = nil
 
 	-- Apply flying arm pose
 	applyFlyingPose()
@@ -769,7 +807,7 @@ function PlayerController.updateHover(time)
 	local baseY = PlayerConfig.START_POSITION.Y + PlayerConfig.HOVER_Y_OFFSET
 	local hoverOffset = math.sin(time * PlayerConfig.HOVER_SPEED) * PlayerConfig.HOVER_AMPLITUDE
 	local hoverPos = Vector3.new(
-		PlayerConfig.START_POSITION.X,
+		getReadyX(),
 		baseY + hoverOffset,
 		PlayerConfig.START_POSITION.Z
 	)
@@ -777,9 +815,10 @@ function PlayerController.updateHover(time)
 	-- Update BodyPosition target
 	bodyPosition.Position = hoverPos
 	
-	-- Also directly set CFrame for smooth following in flying pose
+	-- Directly set CFrame for the flying pose (high lerp factor ensures
+	-- immediate correction if anything knocks the character upright)
 	local targetCFrame = getFlyingCFrame(hoverPos)
-	humanoidRootPart.CFrame = humanoidRootPart.CFrame:Lerp(targetCFrame, 0.1)
+	humanoidRootPart.CFrame = humanoidRootPart.CFrame:Lerp(targetCFrame, 0.8)
 end
 
 --[[
@@ -829,6 +868,15 @@ end
 ]]
 function PlayerController.enableInput()
 	isInputEnabled = true
+end
+
+--[[
+	Sets an external guard callback for mouse/touch jump input.
+	If the callback returns true, the jump is blocked.
+	Used by GameController to block jumps when the mouse is over UI (e.g. leaderboard).
+]]
+function PlayerController.setInputGuard(guardFn)
+	inputGuardCallback = guardFn
 end
 
 --[[

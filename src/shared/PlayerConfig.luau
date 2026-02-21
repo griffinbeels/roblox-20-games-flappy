@@ -41,9 +41,29 @@ PlayerConfig.BASE_FORWARD_SPEED = 40
 PlayerConfig.JUMP_FORCE = 60
 
 -- HOVER: Pre-game ready state (player bobs in the air before Space is pressed)
+PlayerConfig.READY_X_OFFSET = 12    -- X offset from START_POSITION during ready/hover (positive = further right)
 PlayerConfig.HOVER_Y_OFFSET = 13    -- Y offset above START_POSITION.Y
 PlayerConfig.HOVER_AMPLITUDE = 0.5  -- Bobbing amount (studs)
 PlayerConfig.HOVER_SPEED = 2        -- Bobbing speed
+
+-- TILT MODE: How the character orients along their trajectory
+-- "NONE"    = no tilt, player stays perfectly flat
+-- "DIRECT"  = instant rotation matching trajectory (no lag)
+-- "DAMPED"  = BodyGyro spring-damper rotation (smooth but lags behind)
+PlayerConfig.TILT_MODE = "DAMPED"
+
+-- TILT SHARPNESS: Only used in DIRECT and DAMPED modes
+-- 1.0 = true trajectory angle, >1.0 = exaggerated tilt, <1.0 = subtle
+PlayerConfig.TILT_SHARPNESS = 1
+
+-- DAMPED MODE tuning (only used when TILT_MODE = "DAMPED")
+-- P = stiffness: how fast it rotates toward the target (higher = snappier)
+-- D = damping:   how much it resists overshooting (higher = less bounce)
+-- Slow & smooth: P=3000,  D=500
+-- Responsive:    P=15000, D=800
+-- Very snappy:   P=40000, D=1200
+PlayerConfig.TILT_DAMPED_P = 25000
+PlayerConfig.TILT_DAMPED_D = 300
 
 -- COLLISION HITBOX: Used by CollisionDetector for AABB checks
 -- These define the player's logical hitbox around the HumanoidRootPart.

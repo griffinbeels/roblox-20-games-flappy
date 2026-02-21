@@ -12,7 +12,9 @@
       "Bash(\"C:/Users/griff/Desktop/gamedev/20_games/flappy/src/shared/PipeConfig.luau\":*)",
       "Bash(python3:*)",
       "Bash(rojo sourcemap:*)",
-      "mcp__Roblox_Studio__insert_model"
+      "mcp__Roblox_Studio__insert_model",
+      "WebFetch(domain:github.com)",
+      "Bash(grep:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

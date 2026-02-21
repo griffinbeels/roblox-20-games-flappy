@@ -31,6 +31,23 @@ if not requestRespawn then
 	requestRespawn.Parent = remotes
 end
 
+-- ToggleDebugCamera: server fires this to the chatting player to toggle the debug camera panel
+local toggleDebugCamera = remotes:FindFirstChild("ToggleDebugCamera")
+if not toggleDebugCamera then
+	toggleDebugCamera = Instance.new("RemoteEvent")
+	toggleDebugCamera.Name = "ToggleDebugCamera"
+	toggleDebugCamera.Parent = remotes
+end
+
+-- Wire /debugcam chat listener for a single player
+local function wireDebugCamChat(player)
+	player.Chatted:Connect(function(message)
+		if string.lower(message) == "/debugcam" then
+			toggleDebugCamera:FireClient(player)
+		end
+	end)
+end
+
 local lastRespawnTime = {} -- per-player cooldown to prevent spam
 
 requestRespawn.OnServerEvent:Connect(function(player)
@@ -43,8 +60,10 @@ requestRespawn.OnServerEvent:Connect(function(player)
 end)
 
 -- Manually load character on join (since CharacterAutoLoads = false)
+-- Also wire /debugcam chat listener
 Players.PlayerAdded:Connect(function(player)
 	player:LoadCharacter()
+	wireDebugCamChat(player)
 end)
 
 -- Clean up cooldown tracking on leave
@@ -54,6 +73,7 @@ end)
 
 -- Handle players already in the game (Studio fast-start)
 for _, player in ipairs(Players:GetPlayers()) do
+	wireDebugCamChat(player)
 	if not player.Character then
 		task.spawn(function()
 			player:LoadCharacter()
@@ -61,16 +81,25 @@ for _, player in ipairs(Players:GetPlayers()) do
 	end
 end
 
-local success, err = pcall(function()
-	local LeaderboardService = require(script.LeaderboardService)
+local LeaderboardService = nil
+local CurrencyService = nil
+local ShopService = nil
+local MissionService = nil
 
-	-- Initialize the leaderboard service
-	LeaderboardService.init()
+local leaderboardRequireOk, leaderboardModule = pcall(function()
+	return require(script.LeaderboardService)
 end)
-
-if not success then
-	warn("Failed to initialize LeaderboardService:", err)
-	-- Game can still run without leaderboard in Studio
+if leaderboardRequireOk and leaderboardModule then
+	LeaderboardService = leaderboardModule
+	local leaderboardInitOk, leaderboardErr = pcall(function()
+		LeaderboardService.init()
+	end)
+	if not leaderboardInitOk then
+		warn("Failed to initialize LeaderboardService:", leaderboardErr)
+		LeaderboardService = nil
+	end
+else
+	warn("Failed to require LeaderboardService:", leaderboardModule)
 end
 
 -- Initialize GhostService for multiplayer ghost relay
@@ -81,4 +110,88 @@ end)
 
 if not ghostSuccess then
 	warn("Failed to initialize GhostService:", ghostErr)
+end
+
+-- Initialize AnalyticsService for event tracking
+local analyticsOk, analyticsErr = pcall(function()
+	local AnalyticsServiceMod = require(script.AnalyticsService)
+	AnalyticsServiceMod.init()
+end)
+if not analyticsOk then
+	warn("Failed to initialize AnalyticsService:", analyticsErr)
+end
+
+-- Initialize CurrencyService for Bacon currency persistence
+local currencyRequireOk, currencyModule = pcall(function()
+	return require(script.CurrencyService)
+end)
+if currencyRequireOk and currencyModule then
+	CurrencyService = currencyModule
+	local currencyInitOk, currencyErr = pcall(function()
+		CurrencyService.init()
+	end)
+	if not currencyInitOk then
+		warn("Failed to initialize CurrencyService:", currencyErr)
+		CurrencyService = nil
+	end
+else
+	warn("Failed to require CurrencyService:", currencyModule)
+end
+
+-- Initialize ShopService for cosmetic shop persistence
+local shopRequireOk, shopModule = pcall(function()
+	return require(script.ShopService)
+end)
+if shopRequireOk and shopModule then
+	ShopService = shopModule
+	local shopInitOk, shopErr = pcall(function()
+		ShopService.init()
+	end)
+	if not shopInitOk then
+		warn("Failed to initialize ShopService:", shopErr)
+		ShopService = nil
+	end
+else
+	warn("Failed to require ShopService:", shopModule)
+end
+
+-- Initialize MissionService for missions/challenges progression
+local missionRequireOk, missionModule = pcall(function()
+	return require(script.MissionService)
+end)
+if missionRequireOk and missionModule then
+	MissionService = missionModule
+	local missionInitOk, missionErr = pcall(function()
+		MissionService.init({
+			currencyService = CurrencyService,
+			shopService = ShopService,
+		})
+	end)
+	if not missionInitOk then
+		warn("Failed to initialize MissionService:", missionErr)
+		MissionService = nil
+	end
+else
+	warn("Failed to require MissionService:", missionModule)
+end
+
+-- Wire mission event reporters from trusted server services.
+if MissionService then
+	if LeaderboardService and LeaderboardService.setMissionReporter then
+		LeaderboardService.setMissionReporter(function(player, eventName, payload)
+			MissionService.reportServerEvent(player, eventName, payload)
+		end)
+	end
+
+	if CurrencyService and CurrencyService.setMissionReporter then
+		CurrencyService.setMissionReporter(function(player, eventName, payload)
+			MissionService.reportServerEvent(player, eventName, payload)
+		end)
+	end
+
+	if ShopService and ShopService.setMissionReporter then
+		ShopService.setMissionReporter(function(player, eventName, payload)
+			MissionService.reportServerEvent(player, eventName, payload)
+		end)
+	end
 end

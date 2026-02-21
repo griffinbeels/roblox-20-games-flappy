@@ -6,7 +6,6 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local WorldConfig = require(ReplicatedStorage.Shared.WorldConfig)
 local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
 
 local CollisionDetector = {}
@@ -14,6 +13,7 @@ CollisionDetector.__index = CollisionDetector
 
 local PlayerController = nil
 local PipeManager = nil
+local ParallaxBackground = nil
 
 --[[
 	Initializes the CollisionDetector.
@@ -26,27 +26,41 @@ function CollisionDetector.init(playerCtrl, pipeMgr)
 end
 
 --[[
-	Checks for collision with the floor (ground).
-	Player dies if they touch the ground.
+	Sets the ParallaxBackground reference so floor collision can query the actual tiles.
+	@param parallax ParallaxBackground module
+]]
+function CollisionDetector.setParallaxBackground(parallax)
+	ParallaxBackground = parallax
+end
+
+--[[
+	Checks for collision with the floor by reading ParallaxBackground's floor surface part.
+	Player dies if their hitbox overlaps the floor collider/surface.
 	@return boolean - True if colliding with floor
 ]]
 local function checkFloorCollision()
-	if not PlayerController then
+	if not PlayerController or not ParallaxBackground then
 		return false
 	end
-	
+
+	local floorPart = ParallaxBackground.getFloorPart()
+	if not floorPart or not floorPart.Parent then
+		return false
+	end
+
 	local playerPos = PlayerController.getPosition()
 	if not playerPos then
 		return false
 	end
-	
-	local feetY = playerPos.Y - PlayerConfig.HITBOX_HALF_HEIGHT
 
-	-- Floor top is at Y = 0 (baseplate center at -10, height 20, so top at -10 + 10 = 0)
-	local floorTopY = WorldConfig.FLOOR.Y_POSITION + (WorldConfig.FLOOR.HEIGHT / 2)
+	local halfH = PlayerConfig.HITBOX_HALF_HEIGHT
+	local tol = PlayerConfig.COLLISION_TOLERANCE
 
-	-- Player dies if their feet touch or go below the floor
-	return feetY <= floorTopY + PlayerConfig.COLLISION_TOLERANCE
+	local playerMinY = playerPos.Y - halfH
+	local floorMaxY = floorPart.Position.Y + floorPart.Size.Y / 2
+
+	-- Player dies if bottom of hitbox is within tolerance of the floor surface
+	return playerMinY < floorMaxY + tol
 end
 
 --[[

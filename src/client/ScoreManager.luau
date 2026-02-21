@@ -4,10 +4,13 @@
 	Tracks pipes passed and communicates with server for high score persistence.
 
 	FLOW:
-	1. On init: request stored personal best from server, cache locally
+	1. On init: wait for server-created remotes, then request stored personal best
 	2. During gameplay: increment score locally, update local best if beaten
 	3. On game over: submit final score to server (server saves if new high)
 	4. Server fires back the authoritative personal best, client caches it
+
+	IMPORTANT: The client must NEVER create RemoteEvents — it waits for the
+	server-created ones via WaitForChild.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,38 +24,38 @@ local getPersonalBestRemote = nil
 
 --[[
 	Initializes the ScoreManager.
-	Sets up RemoteEvents and requests the stored personal best from the server.
+	Waits for server-created remotes in a background thread so it doesn't
+	block other init. Once found, connects the personal best listener and
+	requests the initial value.
 ]]
 function ScoreManager.init()
-	local remoteFolder = ReplicatedStorage:FindFirstChild("Remotes")
-	if not remoteFolder then
-		remoteFolder = Instance.new("Folder")
-		remoteFolder.Name = "Remotes"
-		remoteFolder.Parent = ReplicatedStorage
-	end
-
-	submitScoreRemote = remoteFolder:FindFirstChild("SubmitScore")
-	if not submitScoreRemote then
-		submitScoreRemote = Instance.new("RemoteEvent")
-		submitScoreRemote.Name = "SubmitScore"
-		submitScoreRemote.Parent = remoteFolder
-	end
-
-	getPersonalBestRemote = remoteFolder:FindFirstChild("GetPersonalBest")
-	if not getPersonalBestRemote then
-		getPersonalBestRemote = Instance.new("RemoteEvent")
-		getPersonalBestRemote.Name = "GetPersonalBest"
-		getPersonalBestRemote.Parent = remoteFolder
-	end
-
-	-- Listen for personal best responses from server
-	getPersonalBestRemote.OnClientEvent:Connect(function(bestScore)
-		local serverBest = bestScore or 0
-		-- Only accept server value if it's higher (avoids overwriting a
-		-- locally-tracked best that hasn't been confirmed by server yet)
-		if serverBest > personalBest then
-			personalBest = serverBest
+	task.spawn(function()
+		local remoteFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
+		if not remoteFolder then
+			warn("[ScoreManager] Remotes folder not found — score persistence disabled.")
+			return
 		end
+
+		submitScoreRemote = remoteFolder:WaitForChild("SubmitScore", 10)
+		getPersonalBestRemote = remoteFolder:WaitForChild("GetPersonalBest", 10)
+
+		if not submitScoreRemote or not getPersonalBestRemote then
+			warn("[ScoreManager] Score remotes not found — score persistence disabled.")
+			return
+		end
+
+		-- Listen for personal best responses from server
+		getPersonalBestRemote.OnClientEvent:Connect(function(bestScore)
+			local serverBest = bestScore or 0
+			-- Only accept server value if it's higher (avoids overwriting a
+			-- locally-tracked best that hasn't been confirmed by server yet)
+			if serverBest > personalBest then
+				personalBest = serverBest
+			end
+		end)
+
+		-- Request initial personal best now that we're connected
+		getPersonalBestRemote:FireServer()
 	end)
 end
 
@@ -77,7 +80,8 @@ end
 	Updates local personal best if beaten.
 	Does NOT send to server — that happens once on game over via submitFinalScore().
 ]]
-function ScoreManager.increment()
+function ScoreManager.increment(playSound)
+	-- playSound defaults to true; pass false for silent score adjustments.
 	currentScore = currentScore + 1
 
 	-- Update personal best locally
@@ -85,12 +89,14 @@ function ScoreManager.increment()
 		personalBest = currentScore
 	end
 
-	-- Play score sound
-	local ok, SoundManager = pcall(function()
-		return require(script.Parent.SoundManager)
-	end)
-	if ok and SoundManager then
-		SoundManager.playScore()
+	-- Play score sound unless explicitly suppressed
+	if playSound ~= false then
+		local ok, SoundManager = pcall(function()
+			return require(script.Parent.SoundManager)
+		end)
+		if ok and SoundManager then
+			SoundManager.playScore()
+		end
 	end
 end
 
@@ -115,7 +121,7 @@ end
 
 --[[
 	Requests personal best from server.
-	Used on initial load to fetch the stored high score.
+	Safe to call before init completes (no-op if remote not found yet).
 ]]
 function ScoreManager.requestPersonalBest()
 	if getPersonalBestRemote then

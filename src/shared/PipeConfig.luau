@@ -126,6 +126,34 @@ PipeConfig.STYLES = {
 }
 
 --============================================================================
+-- PIPE STYLE DEFINITIONS (for shop swapping)
+-- Maps a shop configKey to the STYLES array that should be active.
+--============================================================================
+
+PipeConfig.PIPE_STYLE_DEFS = {
+	neon_pillar = {
+		{ type = "model", assetId = 1918080807, weight = 1 },
+	},
+	classic_green = {
+		{ type = "studs", weight = 1 },
+	},
+}
+
+--[[
+	Sets the active pipe styles from a style definition key.
+	Called by ShopManager when the player equips a pipe style.
+	@param styleKey string — key into PIPE_STYLE_DEFS
+]]
+function PipeConfig.setActiveStyles(styleKey)
+	local def = PipeConfig.PIPE_STYLE_DEFS[styleKey]
+	if not def then
+		warn("[PipeConfig] Unknown style key: " .. tostring(styleKey))
+		return
+	end
+	PipeConfig.STYLES = def
+end
+
+--============================================================================
 -- SPAWN MANAGEMENT
 -- Controls how pipes are spawned and recycled around the player
 --============================================================================
@@ -265,8 +293,11 @@ function PipeConfig.getSpawnAheadDistance()
 	if not halfWidth then
 		return PipeConfig.FALLBACK_SPAWN_AHEAD
 	end
-	-- Right edge is halfWidth + camera X offset from player
-	local rightEdge = halfWidth + CameraConfig.OFFSET_X
+	-- Right edge from player = halfWidth + dynamic camera X offset.
+	-- Use the gameplay screen fraction (player furthest left = camera offset is largest).
+	local fraction = CameraConfig.PLAYER_SCREEN_X_PLAYING
+	local offsetX = (0.5 - fraction) * 2 * halfWidth
+	local rightEdge = halfWidth + offsetX
 	return rightEdge + PipeConfig.SPAWN_AHEAD_PADDING
 end
 
@@ -280,8 +311,11 @@ function PipeConfig.getDespawnBehindDistance()
 	if not halfWidth then
 		return PipeConfig.FALLBACK_DESPAWN_BEHIND
 	end
-	-- Left edge is halfWidth - camera X offset from player
-	local leftEdge = halfWidth - CameraConfig.OFFSET_X
+	-- Left edge from player = halfWidth - dynamic camera X offset.
+	-- Use the gameplay screen fraction for consistent despawn.
+	local fraction = CameraConfig.PLAYER_SCREEN_X_PLAYING
+	local offsetX = (0.5 - fraction) * 2 * halfWidth
+	local leftEdge = halfWidth - offsetX
 	return leftEdge + PipeConfig.DESPAWN_BEHIND_PADDING
 end
 

@@ -11,8 +11,8 @@
 	3. On game over → client submits final score via SubmitScore remote
 	4. Server checks if score > stored best, saves to DataStore if so
 	5. Server fires back the (possibly updated) personal best to client
-	6. Client requests leaderboard page via GetLeaderboardPage RemoteFunction
-	7. Server returns cached leaderboard slice (no DataStore reads per request)
+	6. Client requests all leaderboard entries via GetLeaderboardPage RemoteFunction
+	7. Server returns full cached leaderboard (no DataStore reads per request)
 ]]
 
 local DataStoreService = game:GetService("DataStoreService")
@@ -22,6 +22,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local LeaderboardService = {}
+local missionReporter = nil
 
 -- DataStore handles
 local scoresDataStore = nil
@@ -50,6 +51,16 @@ local cachedBests = {}
 local leaderboardCache = {}   -- Array: {userId, score, displayName}
 local playerRankIndex = {}    -- Map: userId -> rank (1-based)
 local displayNameCache = {}   -- Map: userId -> displayName (persistent)
+
+local function reportMissionEvent(player, eventName, payload)
+	if not missionReporter then return end
+	local ok, err = pcall(function()
+		missionReporter(player, eventName, payload)
+	end)
+	if not ok then
+		warn("[LeaderboardService] Mission reporter failed:", err)
+	end
+end
 
 --[[
 	Resolves a display name for a userId, using cache first.
@@ -139,6 +150,7 @@ local function refreshLeaderboardCache()
 	local newCache = {}
 	local collected = 0
 
+	-- Phase 1: Fetch all entries from the OrderedDataStore (userId + score only)
 	local ok, err = pcall(function()
 		local pages = rankedDataStore:GetSortedAsync(false, math.min(maxEntries, 100))
 
@@ -157,7 +169,7 @@ local function refreshLeaderboardCache()
 					table.insert(newCache, {
 						userId = userId,
 						score = entry.value,
-						displayName = resolveDisplayName(userId),
+						displayName = nil, -- resolved in phase 2
 					})
 				end
 			end
@@ -170,11 +182,27 @@ local function refreshLeaderboardCache()
 		end
 	end)
 
-	if ok then
-		leaderboardCache = newCache
-		rebuildRankIndex()
-	else
+	if not ok then
 		warn("[LeaderboardService] Failed to refresh leaderboard cache: " .. tostring(err))
+		return
+	end
+
+	-- Commit cache immediately so data is available for client requests.
+	-- Display names may be nil — OnServerInvoke resolves priority names
+	-- on demand and uses fallbacks for the rest.
+	leaderboardCache = newCache
+	rebuildRankIndex()
+
+	-- Phase 2: Resolve all display names in parallel (non-blocking).
+	-- Each GetNameFromUserIdAsync is an HTTP roundtrip (~50-200ms).
+	-- Spawning them all at once turns N sequential calls into ~1 round.
+	-- Results update entries in-place and populate displayNameCache.
+	for _, entry in ipairs(newCache) do
+		if not entry.displayName then
+			task.spawn(function()
+				entry.displayName = resolveDisplayName(entry.userId)
+			end)
+		end
 	end
 end
 
@@ -253,6 +281,14 @@ local function savePlayerBest(userId, score)
 end
 
 --[[
+	Injects a mission reporter callback.
+	Callback signature: (player, eventName, payload) -> ()
+]]
+function LeaderboardService.setMissionReporter(callback)
+	missionReporter = callback
+end
+
+--[[
 	Initializes the LeaderboardService.
 	Creates RemoteEvents/RemoteFunctions and wires up server handlers.
 	Starts periodic leaderboard cache refresh.
@@ -297,9 +333,22 @@ function LeaderboardService.init()
 		-- Always fire back the current best so client stays in sync
 		local best = cachedBests[player.UserId] or 0
 		getPersonalBestRemote:FireClient(player, best)
+		reportMissionEvent(player, "score_submitted", {
+			score = score,
+			best = best,
+		})
 	end)
 
-	-- GetLeaderboardPage: client requests a page of leaderboard entries
+	-- Load leaderboard cache BEFORE creating GetLeaderboardPage remote.
+	-- refreshLeaderboardCache blocks only on the DataStore fetch (fast);
+	-- display name resolution is non-blocking (runs in parallel background
+	-- tasks). The client's WaitForChild blocks until the remote is created
+	-- below, guaranteeing the cache has entries (names may still be loading).
+	refreshLeaderboardCache()
+
+	-- GetLeaderboardPage: client requests a page of leaderboard entries.
+	-- Resolves display names for entries visible to the requesting player
+	-- on demand, using fallback names for off-screen entries still loading.
 	local getLeaderboardPageRemote = remoteFolder:FindFirstChild("GetLeaderboardPage")
 	if not getLeaderboardPageRemote then
 		getLeaderboardPageRemote = Instance.new("RemoteFunction")
@@ -307,28 +356,39 @@ function LeaderboardService.init()
 		getLeaderboardPageRemote.Parent = remoteFolder
 	end
 
-	getLeaderboardPageRemote.OnServerInvoke = function(player, centerOnSelf, startRank)
-		local PAGE_SIZE = GameConfig.LEADERBOARD.PAGE_SIZE
+	local visibleRadius = math.floor(GameConfig.LEADERBOARD.SCROLL.VISIBLE_ROWS / 2)
 
-		if centerOnSelf then
-			local rank = playerRankIndex[player.UserId]
-			if rank then
-				startRank = math.max(1, rank - math.floor(PAGE_SIZE / 2))
-			else
-				startRank = 1 -- unranked: show top entries
+	getLeaderboardPageRemote.OnServerInvoke = function(player)
+		local playerUserId = player.UserId
+		local playerRank = playerRankIndex[playerUserId]
+
+		-- Determine the priority window (entries the client will see on screen)
+		local priorityStart, priorityEnd
+		if playerRank then
+			priorityStart = math.max(1, playerRank - visibleRadius)
+			priorityEnd = math.min(#leaderboardCache, playerRank + visibleRadius)
+		else
+			-- Unranked player: leaderboard starts scrolled to the top
+			priorityStart = 1
+			priorityEnd = math.min(#leaderboardCache, visibleRadius * 2 + 1)
+		end
+
+		-- Ensure priority entries have resolved display names.
+		-- resolveDisplayName checks displayNameCache first (instant if the
+		-- background task already resolved it), so this only blocks for
+		-- names that genuinely haven't been fetched yet.
+		for i = priorityStart, priorityEnd do
+			local e = leaderboardCache[i]
+			if e and not e.displayName then
+				e.displayName = resolveDisplayName(e.userId)
 			end
 		end
 
-		-- Clamp
-		startRank = math.clamp(startRank or 1, 1, math.max(1, #leaderboardCache - PAGE_SIZE + 1))
-
-		-- Slice entries
 		local entries = {}
-		for i = startRank, math.min(startRank + PAGE_SIZE - 1, #leaderboardCache) do
-			local e = leaderboardCache[i]
+		for i, e in ipairs(leaderboardCache) do
 			table.insert(entries, {
 				rank = i,
-				displayName = e.displayName,
+				displayName = e.displayName or ("Player_" .. e.userId),
 				score = e.score,
 				userId = e.userId,
 			})
@@ -336,9 +396,8 @@ function LeaderboardService.init()
 
 		return {
 			entries = entries,
-			playerRank = playerRankIndex[player.UserId],
+			playerRank = playerRank,
 			totalEntries = #leaderboardCache,
-			startRank = startRank,
 		}
 	end
 
@@ -359,11 +418,11 @@ function LeaderboardService.init()
 		LeaderboardService.clearLeaderboard()
 	end)
 
-	-- Start periodic leaderboard cache refresh
+	-- Start periodic refresh for subsequent updates
 	task.spawn(function()
 		while true do
-			refreshLeaderboardCache()
 			task.wait(GameConfig.LEADERBOARD.CACHE_REFRESH_INTERVAL)
+			refreshLeaderboardCache()
 		end
 	end)
 end
@@ -400,21 +459,58 @@ end
 ]]
 function LeaderboardService.populateTestData()
 	local testUsers = {
-		{ name = "xXDragonSlayerXx", score = 200 },
-		{ name = "PipeQueen99",      score = 100 },
-		{ name = "FlappyMaster",     score = 80 },
-		{ name = "BirdBrain42",      score = 79 },
-		{ name = "SkyDiver_Pro",     score = 78 },
-		{ name = "CasualCarl",       score = 50 },
-		{ name = "NewbieNate",       score = 40 },
-		{ name = "LuckyLucy",        score = 30 },
-		{ name = "TryHardTim",       score = 20 },
-		{ name = "JustStarted",      score = 10 },
-		{ name = "OneMoreTry",       score = 5 },
-		{ name = "AlmostGotIt",      score = 4 },
-		{ name = "Oops",             score = 3 },
-		{ name = "FirstTimer",       score = 2 },
-		{ name = "LiterallyMe",     score = 1 },
+		{ name = "xXFlappyGodXx",     score = 312 },
+		{ name = "OofMaster9000",      score = 287 },
+		{ name = "PipeQueen99",        score = 256 },
+		{ name = "BloxBirdPro",        score = 231 },
+		{ name = "NoobSlayer_Flap",    score = 200 },
+		{ name = "RobuxRichie",        score = 189 },
+		{ name = "FlapJack_YT",        score = 175 },
+		{ name = "ii_BirdBoy",         score = 163 },
+		{ name = "ObbyKing2024",       score = 150 },
+		{ name = "MegaFlapper",        score = 142 },
+		{ name = "GapDodger",          score = 133 },
+		{ name = "xX_PipeDream_Xx",    score = 127 },
+		{ name = "FlappyPhoenix",      score = 118 },
+		{ name = "SkyDiver_Pro",       score = 112 },
+		{ name = "BirdNerd42",         score = 105 },
+		{ name = "WingsOfSteel",       score = 100 },
+		{ name = "TiltedTowers_Fan",   score = 94 },
+		{ name = "PipeSurvivor",       score = 89 },
+		{ name = "FlutterKing",        score = 83 },
+		{ name = "OofInPeace",         score = 78 },
+		{ name = "CasualCarl",         score = 73 },
+		{ name = "BloxBirdie",         score = 68 },
+		{ name = "NeverGiveUp99",      score = 64 },
+		{ name = "FlapAttack",         score = 59 },
+		{ name = "PixelPigeon",        score = 55 },
+		{ name = "TurboFlapper",       score = 52 },
+		{ name = "LuckyLucy",          score = 48 },
+		{ name = "GravityHater",       score = 45 },
+		{ name = "PipeNightmare",      score = 42 },
+		{ name = "BirdBrain_lol",      score = 40 },
+		{ name = "gg_ez_flap",         score = 37 },
+		{ name = "RobloxRookie",       score = 35 },
+		{ name = "JumpSpammer",        score = 32 },
+		{ name = "FlapOrDie",          score = 30 },
+		{ name = "NewbieNate",         score = 28 },
+		{ name = "WingClipperX",       score = 26 },
+		{ name = "PipeDreamer",        score = 24 },
+		{ name = "FlappyNoob123",      score = 23 },
+		{ name = "AngryBloxBird",      score = 21 },
+		{ name = "TryHardTim",         score = 19 },
+		{ name = "SkyFaller",          score = 17 },
+		{ name = "GapMisser",          score = 15 },
+		{ name = "OofEveryTime",       score = 13 },
+		{ name = "AlmostMadeIt",       score = 11 },
+		{ name = "PanicFlapper",       score = 10 },
+		{ name = "GroundPounder",      score = 8 },
+		{ name = "OneMoreTry",         score = 7 },
+		{ name = "PlsHelpMe",          score = 5 },
+		{ name = "FirstTimer_lol",     score = 4 },
+		{ name = "LiterallyMe",        score = 3 },
+		{ name = "Oops_I_Died",        score = 2 },
+		{ name = "TouchedAPipe",       score = 1 },
 	}
 
 	for i, user in ipairs(testUsers) do

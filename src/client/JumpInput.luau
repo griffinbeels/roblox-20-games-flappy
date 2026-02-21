@@ -13,6 +13,7 @@ function JumpInput.isJump(input: InputObject): boolean
 	return input.KeyCode == Enum.KeyCode.Space
 		or input.KeyCode == Enum.KeyCode.ButtonA
 		or input.UserInputType == Enum.UserInputType.Touch
+		or input.UserInputType == Enum.UserInputType.MouseButton1
 end
 
 -- Returns the display label for the jump key on the current device.
@@ -22,7 +23,7 @@ function JumpInput.getKeyLabel(): string
 	elseif UserInputService.GamepadEnabled and not UserInputService.KeyboardEnabled then
 		return "A"
 	end
-	return "SPACE"
+	return "SPACE / CLICK"
 end
 
 return JumpInput

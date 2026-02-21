@@ -11,9 +11,24 @@ local OptionsUI = {}
 
 local localPlayer = Players.LocalPlayer
 local screenGui = nil
+local wrapper = nil
 local gearButton = nil
 local panel = nil
 local panelOpen = false
+
+-- UIScale: viewport-adaptive scaling
+local UI_REFERENCE_HEIGHT = 800
+local UI_MIN_SCALE = 0.45
+local UI_MAX_SCALE = 1.2
+local uiScaleInstance = nil
+local viewportScaleConnection = nil
+
+local function updateUIScale()
+	if not uiScaleInstance then return end
+	local viewportHeight = workspace.CurrentCamera.ViewportSize.Y
+	local scale = math.clamp(viewportHeight / UI_REFERENCE_HEIGHT, UI_MIN_SCALE, UI_MAX_SCALE)
+	uiScaleInstance.Scale = scale
+end
 
 -- Option state and callbacks
 local options = {
@@ -90,7 +105,25 @@ function OptionsUI.init()
 	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
 
-	-- Gear button
+	-- Wrapper frame (contains gear + panel, anchored top-right, UIScale applied here)
+	wrapper = Instance.new("Frame")
+	wrapper.Name = "OptionsWrapper"
+	wrapper.Size = UDim2.new(0, 220, 0, 200)
+	wrapper.AnchorPoint = Vector2.new(1, 0)
+	wrapper.Position = UDim2.new(1, 0, 0, 0)
+	wrapper.BackgroundTransparency = 1
+	wrapper.Parent = screenGui
+
+	-- UIScale: scales the entire options area to fit any viewport size
+	uiScaleInstance = Instance.new("UIScale")
+	uiScaleInstance.Parent = wrapper
+	updateUIScale()
+
+	viewportScaleConnection = workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		updateUIScale()
+	end)
+
+	-- Gear button (positioned relative to wrapper)
 	gearButton = Instance.new("TextButton")
 	gearButton.Name = "GearButton"
 	gearButton.Size = UDim2.new(0, 36, 0, 36)
@@ -103,13 +136,13 @@ function OptionsUI.init()
 	gearButton.TextSize = 22
 	gearButton.Font = Enum.Font.GothamBold
 	gearButton.AutoButtonColor = true
-	gearButton.Parent = screenGui
+	gearButton.Parent = wrapper
 
 	local gearCorner = Instance.new("UICorner")
 	gearCorner.CornerRadius = UDim.new(0, 6)
 	gearCorner.Parent = gearButton
 
-	-- Dropdown panel
+	-- Dropdown panel (positioned relative to wrapper)
 	panel = Instance.new("Frame")
 	panel.Name = "OptionsPanel"
 	panel.Size = UDim2.new(0, 180, 0, 48)
@@ -119,7 +152,7 @@ function OptionsUI.init()
 	panel.BackgroundTransparency = 0.2
 	panel.BorderSizePixel = 0
 	panel.Visible = false
-	panel.Parent = screenGui
+	panel.Parent = wrapper
 
 	local panelCorner = Instance.new("UICorner")
 	panelCorner.CornerRadius = UDim.new(0, 6)
@@ -169,10 +202,16 @@ function OptionsUI.hide()
 end
 
 function OptionsUI.destroy()
+	if viewportScaleConnection then
+		viewportScaleConnection:Disconnect()
+		viewportScaleConnection = nil
+	end
+	uiScaleInstance = nil
 	if screenGui then
 		screenGui:Destroy()
 		screenGui = nil
 	end
+	wrapper = nil
 	toggleButtons = {}
 	callbacks = {}
 end
