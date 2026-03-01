@@ -11,6 +11,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
 local WorldConfig = require(ReplicatedStorage.Shared.WorldConfig)
+local RuntimeTuning = require(ReplicatedStorage.Shared.RuntimeTuning)
 local JumpInput = require(script.Parent.JumpInput)
 local Workspace = game:GetService("Workspace")
 
@@ -35,6 +36,16 @@ local skipNextCharacterAdded = false -- Set by GameController to skip handler du
 local armPoseConnections = {} -- Connections that maintain the flying arm pose
 local renderStepConnection = nil -- Connection for RenderStepped arm pose maintenance
 local cachedMotor6Ds = nil -- Cache of Motor6D references for the current character
+
+local function getActiveGravity()
+	return tonumber(RuntimeTuning.getActiveGravity()) or tonumber(PlayerConfig.GRAVITY) or 250
+end
+
+local function getActiveJumpForce()
+	local baseJumpForce = tonumber(PlayerConfig.JUMP_FORCE) or 60
+	local jumpPowerMultiplier = tonumber(RuntimeTuning.getActiveJumpPowerMultiplier()) or 1.0
+	return baseJumpForce * jumpPowerMultiplier
+end
 
 --[[
 	Returns a CFrame oriented for the superman flying pose at the given position.
@@ -424,11 +435,12 @@ function PlayerController.jump()
 
 	-- Apply instant upward force (like hitting a ping pong ball)
 	-- Reset Y velocity completely and apply jump force for consistent feel
-	currentVelocity = Vector3.new(currentVelocity.X, PlayerConfig.JUMP_FORCE, 0)
+	local jumpForce = getActiveJumpForce()
+	currentVelocity = Vector3.new(currentVelocity.X, jumpForce, 0)
 	lastJumpTime = tick()
 
 	-- Apply directly to HumanoidRootPart for immediate response
-	humanoidRootPart.Velocity = Vector3.new(humanoidRootPart.Velocity.X, PlayerConfig.JUMP_FORCE, 0)
+	humanoidRootPart.Velocity = Vector3.new(humanoidRootPart.Velocity.X, jumpForce, 0)
 
 	-- Play jump sound (optional - SoundManager may not be loaded yet)
 	local success, SoundManager = pcall(function()
@@ -481,7 +493,7 @@ function PlayerController.startUpdate()
 		-- Apply gravity to velocity (constant downward pull)
 		-- This creates the "falling" feeling that player must prevent with jumps
 		-- Like a ping pong ball - it falls, you tap to keep it up!
-		currentVelocity = currentVelocity - Vector3.new(0, PlayerConfig.GRAVITY * deltaTime, 0)
+		currentVelocity = currentVelocity - Vector3.new(0, getActiveGravity() * deltaTime, 0)
 		
 		-- If on ground, stop downward velocity (but jump can still work)
 		if isOnGround and currentVelocity.Y < 0 then

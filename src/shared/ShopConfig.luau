@@ -1,45 +1,151 @@
 --[[
 	ShopConfig.luau
 
-	Single source of truth for the cosmetic shop: categories, items, UI constants.
-	Adding new items or categories requires only edits to this file.
-
-	ITEM FIELDS:
-	  id          (string)  — unique identifier
-	  name        (string)  — display name
-	  price       (number)  — cost in currency (0 = free)
-	  currencyType(string)  — "bacon" (future: "robux")
-	  default     (bool?)   — true = auto-owned, never needs purchase
-	  comingSoon  (bool?)   — true = non-purchasable placeholder item
-	  configKey   (string)  — key into the runtime config for this category
-	  previewColor(Color3)  — colored square preview in the shop card
-	  previewIcon (string?) — optional emoji/icon shown in preview square
-
-	CATEGORY FIELDS:
-	  id    (string)  — unique identifier, matches key in ITEMS table
-	  label (string)  — display name for tab
-	  icon  (string)  — emoji or short text for tab
+	Single source of truth for the cosmetic shop:
+	- category definitions
+	- item definitions
+	- mission-gated tuning unlock metadata
+	- UI constants
 ]]
 
 local ShopConfig = {}
+local PrestigeConfig = require(script.Parent.PrestigeConfig)
+
+ShopConfig.SHOP_TUNING_ENABLED = PrestigeConfig.ENABLED ~= true
 
 --============================================================================
--- CATEGORIES (ordered — tab order in UI)
+-- CATEGORIES (ordered)
 --============================================================================
 
 ShopConfig.CATEGORIES = {
-	{ id = "trails",      label = "Trails",      icon = "\u{2728}" },  -- sparkles
-	{ id = "pipes",       label = "Pipes",       icon = "\u{1FAA8}" }, -- rock
-	{ id = "backgrounds", label = "Backgrounds", icon = "\u{1F30C}" }, -- milky way
-	{ id = "floors",      label = "Floors",      icon = "\u{1F525}" }, -- fire
+	{ id = "trails",      label = "Trails",      icon = "\u{2728}" },
+	{ id = "poofs",       label = "Poofs",        icon = "\u{1F4A8}" },
+	{ id = "pipes",       label = "Pipes",       icon = "\u{1FAA8}" },
+	{ id = "backgrounds", label = "Backgrounds", icon = "\u{1F30C}" },
+	{ id = "floors",      label = "Floors",      icon = "\u{1F525}" },
 }
 
 --============================================================================
--- ITEMS (keyed by category id)
+-- MISSION-GATED TUNING VALUES
 --============================================================================
 
-ShopConfig.ITEMS = {
-	trails = {
+ShopConfig.TUNING_VALUES = {
+	-- Trails tune speed cap multiplier.
+	trails = { 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00, 3.25, 3.50, 3.75, 4.00 },
+	-- Floors tune gravity.
+	floors = { 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400 },
+	-- Poofs tune jump power multiplier.
+	poofs = { 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00, 3.25, 3.50 },
+}
+
+-- Flexible score formula knobs for unlock challenges.
+-- Challenge for tier N uses the current tier's index and the prior tier's
+-- threshold (so every challenge is achievable with already-unlocked tuning).
+ShopConfig.TUNING_CHALLENGES = {
+	speed = {
+		baseScore = 8,
+		scorePerTier = 3,
+		curve = 1,
+	},
+	gravity = {
+		baseScore = 8,
+		scorePerTier = 3,
+		curve = 1,
+	},
+	jumpPower = {
+		baseScore = 7,
+		scorePerTier = 3,
+		curve = 1,
+	},
+}
+
+local function clamp01(value)
+	return math.clamp(tonumber(value) or 0, 0, 1)
+end
+
+local function lerp(a, b, alpha)
+	return a + (b - a) * clamp01(alpha)
+end
+
+local function lerpColor(fromColor, toColor, alpha)
+	return Color3.new(
+		lerp(fromColor.R, toColor.R, alpha),
+		lerp(fromColor.G, toColor.G, alpha),
+		lerp(fromColor.B, toColor.B, alpha)
+	)
+end
+
+local function formatNumber(value, decimals, keepOneDecimalIfInteger)
+	local text = string.format("%." .. tostring(decimals) .. "f", tonumber(value) or 0)
+	text = text:gsub("0+$", "")
+	text = text:gsub("%.$", "")
+	if keepOneDecimalIfInteger and not text:find("%.") then
+		text = text .. ".0"
+	end
+	return text
+end
+
+local function formatMultiplier(value)
+	return formatNumber(value, 2, true)
+end
+
+local function formatInteger(value)
+	return tostring(math.floor((tonumber(value) or 0) + 0.5))
+end
+
+local function toToken(value)
+	local text = formatNumber(value, 2, false)
+	text = text:gsub("%.", "_")
+	if text == "" then
+		return "0"
+	end
+	return text
+end
+
+function ShopConfig.computeChallengeScore(metricKey, tierIndex)
+	local formula = ShopConfig.TUNING_CHALLENGES[metricKey] or {}
+	local baseScore = tonumber(formula.baseScore) or 10
+	local scorePerTier = tonumber(formula.scorePerTier) or 3
+	local curve = tonumber(formula.curve) or 1
+	local normalizedTier = math.max(2, math.floor(tonumber(tierIndex) or 2))
+	local tierDelta = normalizedTier - 2
+	local scaled = baseScore + (scorePerTier * (tierDelta ^ curve))
+	return math.max(1, math.floor(scaled + 0.5))
+end
+
+local function buildUnlockMission(config)
+	local scoreTarget = ShopConfig.computeChallengeScore(config.metricFormulaKey, config.tierIndex)
+	local missionId = string.format("unlock_%s_tier_%02d", config.metricId, config.tierIndex)
+	local progressPath = string.format(
+		"stats.best_score_at_%s_%s",
+		config.metricStatToken,
+		toToken(config.thresholdValue)
+	)
+
+	local mission = {
+		id = missionId,
+		title = string.format("Unlock %s", config.unlockLabel),
+		description = string.format(
+			"Reach score %d at %s+ to unlock %s in the shop.",
+			scoreTarget,
+			config.thresholdLabel,
+			config.unlockLabel
+		),
+		scoreTarget = scoreTarget,
+		progressPath = progressPath,
+		metricField = config.metricField,
+		thresholdValue = tonumber(config.thresholdValue) or 0,
+	}
+
+	if type(config.requiresMissionId) == "string" and config.requiresMissionId ~= "" then
+		mission.requiresMissionId = config.requiresMissionId
+	end
+
+	return mission
+end
+
+local function buildClassicTrailItems()
+	return {
 		{
 			id = "trail_rainbow",
 			name = "Rainbow Nyan Cat",
@@ -52,7 +158,7 @@ ShopConfig.ITEMS = {
 		{
 			id = "trail_smoke",
 			name = "Smokey",
-			price = 250,
+			price = 2500,
 			currencyType = "bacon",
 			configKey = "Smoke",
 			previewColor = Color3.fromRGB(200, 200, 200),
@@ -66,7 +172,259 @@ ShopConfig.ITEMS = {
 			previewColor = Color3.fromRGB(230, 180, 40),
 			previewIcon = "\u{1F6A7}",
 		},
-	},
+	}
+end
+
+local function buildClassicPoofItems()
+	return {
+		{
+			id = "poof_glitter",
+			name = "Glitter Burst",
+			price = 0,
+			currencyType = "bacon",
+			default = true,
+			configKey = "Glitter",
+			previewColor = Color3.fromRGB(255, 212, 95),
+			previewIcon = "\u{2728}",
+		},
+		{
+			id = "poof_smoke",
+			name = "Smoke Cloud",
+			price = 1750,
+			currencyType = "bacon",
+			configKey = "Smoke",
+			previewColor = Color3.fromRGB(185, 185, 185),
+		},
+		{
+			id = "poof_more_coming_soon",
+			name = "MORE SOON",
+			price = 0,
+			currencyType = "comingSoon",
+			comingSoon = true,
+			previewColor = Color3.fromRGB(230, 180, 40),
+			previewIcon = "\u{1F6A7}",
+		},
+	}
+end
+
+local function buildClassicFloorItems()
+	return {
+		{
+			id = "floor_lava_mesh",
+			name = "Literally Lava",
+			price = 0,
+			currencyType = "bacon",
+			default = true,
+			configKey = "LAVA_MESH",
+			previewColor = Color3.fromRGB(200, 80, 20),
+		},
+		{
+			id = "floor_dark_gray",
+			name = "Moon Floor",
+			price = 2000,
+			currencyType = "bacon",
+			configKey = "DARK_GRAY",
+			previewColor = Color3.fromRGB(91, 91, 91),
+		},
+		{
+			id = "floor_more_coming_soon",
+			name = "MORE SOON",
+			price = 0,
+			currencyType = "comingSoon",
+			comingSoon = true,
+			previewColor = Color3.fromRGB(230, 180, 40),
+			previewIcon = "\u{1F6A7}",
+		},
+	}
+end
+
+local function buildTrailItems()
+	local values = ShopConfig.TUNING_VALUES.trails
+	local total = #values
+	local items = {}
+	local previousMissionId = nil
+
+	local colorFrom = Color3.fromRGB(90, 180, 255)
+	local colorTo = Color3.fromRGB(255, 110, 90)
+
+	for index, speedValue in ipairs(values) do
+		local alpha = if total <= 1 then 0 else (index - 1) / (total - 1)
+		local previewColor = lerpColor(colorFrom, colorTo, alpha)
+
+		local item = {
+			price = 0,
+			currencyType = "bacon",
+			configKey = if (index % 2 == 0) then "Smoke" else "Rainbow",
+			previewColor = previewColor,
+			speedCapMultiplier = speedValue,
+		}
+
+		if index == 1 then
+			item.id = "trail_rainbow"
+			item.name = "Speed Trail " .. formatMultiplier(speedValue) .. "x"
+			item.default = true
+			item.configKey = "Rainbow"
+		elseif index == 2 then
+			item.id = "trail_smoke"
+			item.name = "Speed Trail " .. formatMultiplier(speedValue) .. "x"
+			item.configKey = "Smoke"
+		else
+			item.id = string.format("trail_speed_tier_%02d", index)
+			item.name = "Speed Trail " .. formatMultiplier(speedValue) .. "x"
+		end
+
+		if index > 1 then
+			local thresholdValue = values[index - 1]
+			local unlockMission = buildUnlockMission({
+				metricId = "speed",
+				metricFormulaKey = "speed",
+				metricStatToken = "speed",
+				metricField = "speedCapMultiplier",
+				tierIndex = index,
+				thresholdValue = thresholdValue,
+				thresholdLabel = "speed " .. formatMultiplier(thresholdValue) .. "x",
+				unlockLabel = "Speed " .. formatMultiplier(speedValue) .. "x",
+				requiresMissionId = previousMissionId,
+			})
+			item.requiredMissionId = unlockMission.id
+			item.unlockMission = unlockMission
+			previousMissionId = unlockMission.id
+		end
+
+		table.insert(items, item)
+	end
+
+	return items
+end
+
+local function buildFloorItems()
+	local values = ShopConfig.TUNING_VALUES.floors
+	local total = #values
+	local items = {}
+	local previousMissionId = nil
+	local floorStyles = { "LAVA_MESH", "DARK_GRAY", "LAVA_SOLID" }
+
+	local colorFrom = Color3.fromRGB(245, 140, 60)
+	local colorTo = Color3.fromRGB(130, 130, 130)
+
+	for index, gravityValue in ipairs(values) do
+		local alpha = if total <= 1 then 0 else (index - 1) / (total - 1)
+		local previewColor = lerpColor(colorFrom, colorTo, alpha)
+
+		local item = {
+			price = 0,
+			currencyType = "bacon",
+			configKey = floorStyles[((index - 1) % #floorStyles) + 1],
+			previewColor = previewColor,
+			gravity = gravityValue,
+		}
+
+		if index == 1 then
+			item.id = "floor_lava_mesh"
+			item.name = "Gravity Floor " .. formatInteger(gravityValue)
+			item.default = true
+			item.configKey = "LAVA_MESH"
+		elseif index == 2 then
+			item.id = "floor_dark_gray"
+			item.name = "Gravity Floor " .. formatInteger(gravityValue)
+			item.configKey = "DARK_GRAY"
+		else
+			item.id = string.format("floor_gravity_tier_%02d", index)
+			item.name = "Gravity Floor " .. formatInteger(gravityValue)
+		end
+
+		if index > 1 then
+			local thresholdValue = values[index - 1]
+			local unlockMission = buildUnlockMission({
+				metricId = "gravity",
+				metricFormulaKey = "gravity",
+				metricStatToken = "gravity",
+				metricField = "gravity",
+				tierIndex = index,
+				thresholdValue = thresholdValue,
+				thresholdLabel = "gravity " .. formatInteger(thresholdValue),
+				unlockLabel = "Gravity " .. formatInteger(gravityValue),
+				requiresMissionId = previousMissionId,
+			})
+			item.requiredMissionId = unlockMission.id
+			item.unlockMission = unlockMission
+			previousMissionId = unlockMission.id
+		end
+
+		table.insert(items, item)
+	end
+
+	return items
+end
+
+local function buildPoofItems()
+	local values = ShopConfig.TUNING_VALUES.poofs
+	local total = #values
+	local items = {}
+	local previousMissionId = nil
+	local poofStyles = { "Smoke", "Glitter", "Burst" }
+
+	local colorFrom = Color3.fromRGB(140, 210, 255)
+	local colorTo = Color3.fromRGB(255, 150, 220)
+
+	for index, jumpValue in ipairs(values) do
+		local alpha = if total <= 1 then 0 else (index - 1) / (total - 1)
+		local previewColor = lerpColor(colorFrom, colorTo, alpha)
+
+		local item = {
+			price = 0,
+			currencyType = "bacon",
+			configKey = poofStyles[((index - 1) % #poofStyles) + 1],
+			previewColor = previewColor,
+			jumpPowerMultiplier = jumpValue,
+		}
+
+		if index == 1 then
+			item.id = "poof_smoke"
+			item.name = "Jump Poof " .. formatMultiplier(jumpValue) .. "x"
+			item.default = true
+			item.configKey = "Smoke"
+		elseif index == 2 then
+			item.id = "poof_glitter"
+			item.name = "Jump Poof " .. formatMultiplier(jumpValue) .. "x"
+			item.configKey = "Glitter"
+		else
+			item.id = string.format("poof_jump_tier_%02d", index)
+			item.name = "Jump Poof " .. formatMultiplier(jumpValue) .. "x"
+		end
+
+		if index > 1 then
+			local thresholdValue = values[index - 1]
+			local unlockMission = buildUnlockMission({
+				metricId = "jump_power",
+				metricFormulaKey = "jumpPower",
+				metricStatToken = "jump",
+				metricField = "jumpPowerMultiplier",
+				tierIndex = index,
+				thresholdValue = thresholdValue,
+				thresholdLabel = "jump power " .. formatMultiplier(thresholdValue) .. "x",
+				unlockLabel = "Jump Power " .. formatMultiplier(jumpValue) .. "x",
+				requiresMissionId = previousMissionId,
+			})
+			item.requiredMissionId = unlockMission.id
+			item.unlockMission = unlockMission
+			previousMissionId = unlockMission.id
+		end
+
+		table.insert(items, item)
+	end
+
+	return items
+end
+
+--============================================================================
+-- ITEMS (keyed by category id)
+--============================================================================
+
+ShopConfig.ITEMS = {
+	trails = if ShopConfig.SHOP_TUNING_ENABLED then buildTrailItems() else buildClassicTrailItems(),
+
+	poofs = if ShopConfig.SHOP_TUNING_ENABLED then buildPoofItems() else buildClassicPoofItems(),
 
 	pipes = {
 		{
@@ -81,7 +439,7 @@ ShopConfig.ITEMS = {
 		{
 			id = "pipe_classic_green",
 			name = "Flappy Pipe",
-			price = 50,
+			price = 500,
 			currencyType = "bacon",
 			configKey = "classic_green",
 			previewColor = Color3.fromRGB(0, 180, 0),
@@ -107,14 +465,6 @@ ShopConfig.ITEMS = {
 			configKey = "DARK_PURPLE",
 			previewColor = Color3.fromRGB(15, 8, 25),
 		},
-		-- {
-		-- 	id = "bg_dark_plain",
-		-- 	name = "Dark Plain",
-		-- 	price = 20,
-		-- 	currencyType = "bacon",
-		-- 	configKey = "DARK_PLAIN",
-		-- 	previewColor = Color3.fromRGB(10, 5, 20),
-		-- },
 		{
 			id = "bg_more_coming_soon",
 			name = "MORE SOON",
@@ -126,42 +476,7 @@ ShopConfig.ITEMS = {
 		},
 	},
 
-	floors = {
-		{
-			id = "floor_lava_mesh",
-			name = "Literally Lava",
-			price = 0,
-			currencyType = "bacon",
-			default = true,
-			configKey = "LAVA_MESH",
-			previewColor = Color3.fromRGB(200, 80, 20),
-		},
-		-- {
-		-- 	id = "floor_lava_solid",
-		-- 	name = "Lava Solid",
-		-- 	price = 15,
-		-- 	currencyType = "bacon",
-		-- 	configKey = "LAVA_SOLID",
-		-- 	previewColor = Color3.fromRGB(200, 50, 0),
-		-- },
-		{
-			id = "floor_dark_gray",
-			name = "Moon Floor",
-			price = 100,
-			currencyType = "bacon",
-			configKey = "DARK_GRAY",
-			previewColor = Color3.fromRGB(91, 91, 91),
-		},
-		{
-			id = "floor_more_coming_soon",
-			name = "MORE SOON",
-			price = 0,
-			currencyType = "comingSoon",
-			comingSoon = true,
-			previewColor = Color3.fromRGB(230, 180, 40),
-			previewIcon = "\u{1F6A7}",
-		},
-	},
+	floors = if ShopConfig.SHOP_TUNING_ENABLED then buildFloorItems() else buildClassicFloorItems(),
 }
 
 --============================================================================
@@ -233,6 +548,9 @@ ShopConfig.UI = {
 	EQUIP_TEXT_COLOR = Color3.new(1, 1, 1),
 	EQUIPPED_COLOR = Color3.fromRGB(80, 80, 80),
 	EQUIPPED_TEXT_COLOR = Color3.fromRGB(180, 180, 180),
+	LOCKED_COLOR = Color3.fromRGB(70, 55, 35),
+	LOCKED_TEXT_COLOR = Color3.fromRGB(245, 220, 170),
+	LOCKED_TEXT = "Complete Mission",
 	INSUFFICIENT_COLOR = Color3.fromRGB(100, 40, 40),
 	INSUFFICIENT_TEXT_COLOR = Color3.fromRGB(160, 120, 120),
 	COMING_SOON_COLOR = Color3.fromRGB(120, 95, 35),
@@ -250,16 +568,14 @@ ShopConfig.UI = {
 --============================================================================
 
 ShopConfig.READY_BUTTON = {
-	-- ReadyUI stacks ready buttons vertically to the right of the leaderboard.
-	-- STUDS_OFFSET is treated as legacy fallback (Z only by default).
-	BILLBOARD_SIZE = UDim2.new(8, 0, 8, 0),    -- studs (same coordinate space as leaderboard)
+	BILLBOARD_SIZE = UDim2.new(8, 0, 8, 0),
 	STUDS_OFFSET = Vector3.new(0, 0, 0),
-	ROW_ORDER = 2, -- higher order appears lower in the right-side stack
+	ROW_ORDER = 2,
 	LOCAL_OFFSET = Vector3.new(0, 0, 0),
 	BG_COLOR = Color3.fromRGB(255, 200, 80),
 	BG_TRANSPARENCY = 0.1,
 	CORNER_RADIUS = UDim.new(0.15, 0),
-	TEXT = "\u{1F6D2}",    -- shopping cart emoji
+	TEXT = "\u{1F6D2}",
 	LABEL = "SHOP",
 	LABEL_FONT = Enum.Font.GothamBlack,
 	LABEL_COLOR = Color3.fromRGB(50, 35, 10),
@@ -275,12 +591,27 @@ ShopConfig.DATASTORE_NAME = "FlappyBirdShop"
 -- HELPER FUNCTIONS
 --============================================================================
 
+local function cloneTable(value)
+	if type(value) ~= "table" then
+		return value
+	end
+
+	local output = {}
+	for key, child in pairs(value) do
+		output[key] = cloneTable(child)
+	end
+	return output
+end
+
 -- Item lookup cache (built lazily)
 local _itemCache = nil
 local _categoryCache = nil
 
 local function ensureCache()
-	if _itemCache then return end
+	if _itemCache then
+		return
+	end
+
 	_itemCache = {}
 	_categoryCache = {}
 	for catId, items in pairs(ShopConfig.ITEMS) do
@@ -291,41 +622,53 @@ local function ensureCache()
 	end
 end
 
---[[
-	Returns the item table for a given itemId, or nil.
-]]
 function ShopConfig.getItem(itemId)
 	ensureCache()
 	return _itemCache[itemId]
 end
 
---[[
-	Returns the array of items for a category id.
-]]
 function ShopConfig.getItemsByCategory(catId)
 	return ShopConfig.ITEMS[catId] or {}
 end
 
---[[
-	Returns the default item for a category (the one with default=true).
-]]
 function ShopConfig.getDefault(catId)
 	local items = ShopConfig.ITEMS[catId]
-	if not items then return nil end
+	if not items then
+		return nil
+	end
+
 	for _, item in ipairs(items) do
 		if item.default then
 			return item
 		end
 	end
-	return items[1] -- fallback to first item
+
+	return items[1]
 end
 
---[[
-	Returns the category id for a given itemId.
-]]
 function ShopConfig.getCategoryForItem(itemId)
 	ensureCache()
 	return _categoryCache[itemId]
+end
+
+function ShopConfig.getMissionLockedItems()
+	local output = {}
+
+	for _, category in ipairs(ShopConfig.CATEGORIES) do
+		for _, item in ipairs(ShopConfig.getItemsByCategory(category.id)) do
+			if type(item.requiredMissionId) == "string" and type(item.unlockMission) == "table" then
+				table.insert(output, {
+					categoryId = category.id,
+					itemId = item.id,
+					itemName = item.name,
+					requiredMissionId = item.requiredMissionId,
+					unlockMission = cloneTable(item.unlockMission),
+				})
+			end
+		end
+	end
+
+	return output
 end
 
 return ShopConfig

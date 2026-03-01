@@ -5,7 +5,7 @@
 	- Persists mission stats + completion state per player
 	- Accepts tracked events (client + server)
 	- Evaluates mission conditions from MissionConfig
-	- Grants rewards (bacon + shop items)
+	- Grants rewards (bacon + shop items) on explicit redeem
 	- Pushes mission state/completion updates to clients
 ]]
 
@@ -14,6 +14,8 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local MissionConfig = require(ReplicatedStorage.Shared.MissionConfig)
+local ConditionEvaluator = require(ReplicatedStorage.Shared.ConditionEvaluator)
+local PrestigeConfig = require(ReplicatedStorage.Shared.PrestigeConfig)
 
 local MissionService = {}
 
@@ -42,13 +44,19 @@ local exitSaveStarted = {} -- userId -> true once an exit save has started (Play
 -- Dependencies (injected from init.server.luau)
 local currencyService = nil
 local shopService = nil
+local prestigeService = nil
 
 -- Remotes
 local getStateRemote = nil
 local reportEventRemote = nil
 local stateUpdatedRemote = nil
+local redeemMissionRemote = nil
 
 local initialized = false
+local scoreThresholdTrackers = {}
+if type(MissionConfig.getScoreThresholdTrackers) == "function" then
+	scoreThresholdTrackers = MissionConfig.getScoreThresholdTrackers() or {}
+end
 
 --============================================================================
 -- PROFILE SHAPE
@@ -59,7 +67,8 @@ local function createDefaultProfile()
 		version = MissionConfig.VERSION,
 		stats = {},
 		flags = {},
-		completed = {}, -- [missionId] = unix timestamp
+		completed = {}, -- [missionId] = unix timestamp (condition satisfied)
+		redeemed = {}, -- [missionId] = unix timestamp (reward claimed)
 	}
 end
 
@@ -76,6 +85,37 @@ local function copyPrimitiveMap(source)
 				output[key] = value
 			end
 		end
+	end
+
+	return output
+end
+
+local function copySpeedGraduationMap(source)
+	local output = {}
+	if type(source) ~= "table" then
+		return output
+	end
+
+	for key, value in pairs(source) do
+		if type(key) == "string" and string.match(key, "^p%d+$") then
+			local num = tonumber(value)
+			if num ~= nil then
+				output[key] = math.clamp(math.floor(num), 0, MissionConfig.MAX_TRACKED_SCORE)
+			end
+		end
+	end
+
+	return output
+end
+
+local function copyMissionStatsMap(source)
+	local output = copyPrimitiveMap(source)
+	if type(source) ~= "table" then
+		return output
+	end
+
+	if type(source.speed_graduation_by_level) == "table" then
+		output.speed_graduation_by_level = copySpeedGraduationMap(source.speed_graduation_by_level)
 	end
 
 	return output
@@ -109,9 +149,15 @@ local function sanitizeProfile(raw)
 	if type(raw.version) == "number" then
 		profile.version = raw.version
 	end
-	profile.stats = copyPrimitiveMap(raw.stats)
+	profile.stats = copyMissionStatsMap(raw.stats)
 	profile.flags = copyPrimitiveMap(raw.flags)
 	profile.completed = copyCompletedMap(raw.completed)
+	if type(raw.redeemed) == "table" then
+		profile.redeemed = copyCompletedMap(raw.redeemed)
+	else
+		-- Migration: before VERSION 2, completed missions were auto-rewarded.
+		profile.redeemed = copyCompletedMap(raw.completed)
+	end
 
 	return profile
 end
@@ -165,6 +211,7 @@ local function saveProfile(userId, force)
 		stats = profile.stats,
 		flags = profile.flags,
 		completed = profile.completed,
+		redeemed = profile.redeemed,
 	}
 
 	local ok, err = pcall(function()
@@ -274,95 +321,6 @@ local function resolveParent(root, path, createMissing)
 	return node, keys[#keys]
 end
 
---============================================================================
--- CONDITION EVALUATION
---============================================================================
-
-local function evaluateCondition(condition, context)
-	if type(condition) ~= "table" then
-		return false
-	end
-
-	local conditionType = condition.type or "compare"
-
-	if conditionType == "all" then
-		local list = condition.conditions
-		if type(list) ~= "table" then
-			return false
-		end
-		for _, subCondition in ipairs(list) do
-			if not evaluateCondition(subCondition, context) then
-				return false
-			end
-		end
-		return true
-	end
-
-	if conditionType == "any" then
-		local list = condition.conditions
-		if type(list) ~= "table" then
-			return false
-		end
-		for _, subCondition in ipairs(list) do
-			if evaluateCondition(subCondition, context) then
-				return true
-			end
-		end
-		return false
-	end
-
-	if conditionType == "not" then
-		return not evaluateCondition(condition.condition, context)
-	end
-
-	if conditionType == "compare" then
-		local left = readPath(context, condition.path)
-		if left == nil and condition.default ~= nil then
-			left = condition.default
-		end
-
-		local right = condition.value
-		if condition.valuePath then
-			right = readPath(context, condition.valuePath)
-		end
-
-		local op = condition.op or ">="
-		if op == "==" then
-			return left == right
-		end
-		if op == "~=" then
-			return left ~= right
-		end
-
-		if op == "contains_key" then
-			return type(left) == "table" and left[right] ~= nil
-		end
-		if op == "contains_value" then
-			if type(left) ~= "table" then
-				return false
-			end
-			for _, value in pairs(left) do
-				if value == right then
-					return true
-				end
-			end
-			return false
-		end
-
-		if type(left) ~= "number" or type(right) ~= "number" then
-			return false
-		end
-
-		if op == ">=" then return left >= right end
-		if op == ">" then return left > right end
-		if op == "<=" then return left <= right end
-		if op == "<" then return left < right end
-		return false
-	end
-
-	return false
-end
-
 local function requirementsMet(profile, mission)
 	local requirements = mission.requires
 	if type(requirements) ~= "table" then
@@ -376,6 +334,68 @@ local function requirementsMet(profile, mission)
 	end
 
 	return true
+end
+
+local function getCurrentPrestigeLevel(userId)
+	if not prestigeService or type(prestigeService.getCurrentLevel) ~= "function" then
+		return 0
+	end
+
+	local ok, level = pcall(prestigeService.getCurrentLevel, userId)
+	if not ok then
+		return 0
+	end
+
+	return math.max(0, math.floor(tonumber(level) or 0))
+end
+
+local function getDynamicPrestigeMissions(userId)
+	if PrestigeConfig.ENABLED ~= true then
+		return {}
+	end
+
+	local currentPrestigeLevel = getCurrentPrestigeLevel(userId)
+	if type(PrestigeConfig.getNextPrestigeMissions) == "function" then
+		local missions = PrestigeConfig.getNextPrestigeMissions(currentPrestigeLevel)
+		if type(missions) == "table" then
+			return missions
+		end
+	end
+
+	local mission = PrestigeConfig.getNextPrestigeMission(currentPrestigeLevel)
+	if mission then
+		return { mission }
+	end
+
+	return {}
+end
+
+local function getMissionDefsForUser(userId)
+	local missionDefs = {}
+
+	for _, mission in ipairs(MissionConfig.MISSIONS) do
+		table.insert(missionDefs, mission)
+	end
+
+	for _, prestigeMission in ipairs(getDynamicPrestigeMissions(userId)) do
+		table.insert(missionDefs, prestigeMission)
+	end
+
+	return missionDefs
+end
+
+local function findMissionDefForUser(userId, missionId)
+	if type(missionId) ~= "string" or missionId == "" then
+		return nil
+	end
+
+	for _, mission in ipairs(getMissionDefsForUser(userId)) do
+		if mission.id == missionId then
+			return mission
+		end
+	end
+
+	return nil
 end
 
 --============================================================================
@@ -467,6 +487,143 @@ local function applyUpdate(profile, update, payload)
 	return false
 end
 
+local function updateMaxAtPath(profile, path, value)
+	if type(path) ~= "string" or path == "" then
+		return false
+	end
+
+	local parent, key = resolveParent(profile, path, true)
+	if not parent or not key then
+		return false
+	end
+
+	local currentValue = tonumber(parent[key]) or 0
+	if value > currentValue then
+		parent[key] = value
+		return true
+	end
+
+	return false
+end
+
+local function applyScoreThresholdTrackers(profile, payload)
+	if #scoreThresholdTrackers <= 0 then
+		return false
+	end
+
+	local rawScore = tonumber(payload and payload.score)
+	if not rawScore then
+		return false
+	end
+
+	local safeScore = math.clamp(math.floor(rawScore), 0, MissionConfig.MAX_TRACKED_SCORE)
+	local changed = false
+
+	for _, tracker in ipairs(scoreThresholdTrackers) do
+		if type(tracker) == "table" then
+			local metricField = tostring(tracker.metricField or "")
+			local metricValue = tonumber(payload[metricField])
+			local thresholdValue = tonumber(tracker.thresholdValue) or 0
+			local path = tostring(tracker.path or "")
+
+			if metricValue and metricValue >= thresholdValue and path ~= "" then
+				if updateMaxAtPath(profile, path, safeScore) then
+					changed = true
+				end
+			end
+		end
+	end
+
+	return changed
+end
+
+local function getEffectivePrestigeTrackingThresholds()
+	if type(PrestigeConfig.getEffectiveTrackingThresholds) == "function" then
+		local ok, thresholds = pcall(PrestigeConfig.getEffectiveTrackingThresholds)
+		if ok and type(thresholds) == "table" then
+			return thresholds
+		end
+	end
+
+	local tracking = PrestigeConfig.TRACKING or {}
+	return {
+		speedCapMultiplier = tonumber(tracking.SPEED_THRESHOLD) or 0,
+		gravity = tonumber(tracking.GRAVITY_THRESHOLD) or 0,
+	}
+end
+
+local function applyPrestigeMissionTrackers(userId, profile, payload)
+	if PrestigeConfig.ENABLED ~= true then
+		return false
+	end
+	if type(profile) ~= "table" or type(profile.stats) ~= "table" then
+		return false
+	end
+
+	local rawScore = tonumber(payload and payload.score)
+	if rawScore == nil then
+		return false
+	end
+
+	local safeScore = math.clamp(math.floor(rawScore), 0, MissionConfig.MAX_TRACKED_SCORE)
+	local changed = false
+
+	local thresholds = getEffectivePrestigeTrackingThresholds()
+	local gravityThreshold = tonumber(thresholds.gravity) or math.huge
+	local selectedGravity = tonumber(payload and payload.gravity) or 0
+	if selectedGravity >= gravityThreshold then
+		if updateMaxAtPath(profile, "stats.best_score_at_gravity_threshold", safeScore) then
+			changed = true
+		end
+	end
+
+	local currentPrestigeLevel = getCurrentPrestigeLevel(userId)
+	local targetPrestigeLevel = math.max(1, currentPrestigeLevel + 1)
+	local requiredCap = if type(PrestigeConfig.getSpeedGraduationTargetForLevel) == "function"
+		then tonumber(PrestigeConfig.getSpeedGraduationTargetForLevel(targetPrestigeLevel))
+		else nil
+	if requiredCap == nil then
+		return changed
+	end
+
+	local tolerance = if type(PrestigeConfig.getSpeedGraduationToleranceForLevel) == "function"
+		then tonumber(PrestigeConfig.getSpeedGraduationToleranceForLevel(targetPrestigeLevel))
+		else nil
+	tolerance = math.max(0.01, tonumber(tolerance) or 0.01)
+
+	local selectedCap = tonumber(payload and payload.speedCapMultiplier) or 0
+	if selectedCap + 0.0001 < (requiredCap - tolerance) then
+		return changed
+	end
+
+	local reachedSpeed = tonumber(payload and payload.maxSpeedMultiplierReached)
+	if reachedSpeed == nil then
+		-- Compatibility fallback for older clients that do not send peak speed.
+		reachedSpeed = selectedCap
+	end
+	reachedSpeed = math.min(reachedSpeed, selectedCap)
+	if reachedSpeed + 0.0001 < (requiredCap - tolerance) then
+		return changed
+	end
+
+	local statPath = nil
+	if type(PrestigeConfig.getSpeedGraduationStatPathForTargetLevel) == "function" then
+		statPath = PrestigeConfig.getSpeedGraduationStatPathForTargetLevel(targetPrestigeLevel)
+	end
+	if type(statPath) ~= "string" or statPath == "" then
+		local statKey = if type(PrestigeConfig.getSpeedGraduationStatKeyForCurrentLevel) == "function"
+			then PrestigeConfig.getSpeedGraduationStatKeyForCurrentLevel(currentPrestigeLevel)
+			else ("p" .. tostring(currentPrestigeLevel))
+		statPath = string.format("stats.speed_graduation_by_level.%s", tostring(statKey))
+	end
+
+	if updateMaxAtPath(profile, statPath, safeScore) then
+		changed = true
+	end
+
+	return changed
+end
+
 local function passesCooldown(userId, eventName, eventDef)
 	local cooldown = eventDef.cooldown or 0
 	if cooldown <= 0 then
@@ -490,6 +647,13 @@ local function passesCooldown(userId, eventName, eventDef)
 end
 
 local function passesRunGate(userId, eventDef)
+	if eventDef.requiresRunActive and not runActiveByUser[userId] then
+		return false
+	end
+	if eventDef.requiresRunInactive and runActiveByUser[userId] then
+		return false
+	end
+
 	if eventDef.startRun then
 		if runActiveByUser[userId] then
 			return false
@@ -611,6 +775,35 @@ local function grantShopItemReward(userId, reward, syncData)
 	}
 end
 
+local function grantShopUnlockReward(_userId, reward, _syncData)
+	local itemId = reward.itemId
+	if type(itemId) ~= "string" or itemId == "" then
+		return {
+			type = "shop_unlock",
+			itemId = tostring(itemId),
+			granted = false,
+			reason = "Invalid item ID",
+		}
+	end
+
+	-- Unlock missions gate purchase eligibility; they do not grant ownership.
+	return {
+		type = "shop_unlock",
+		itemId = itemId,
+		granted = true,
+	}
+end
+
+local function grantPrestigeLevelReward(_userId, reward, _syncData)
+	local level = math.max(1, math.floor(tonumber(reward.level) or 1))
+	return {
+		type = "prestige_level",
+		level = level,
+		granted = true,
+		displayOnly = true,
+	}
+end
+
 local function grantRewards(userId, mission)
 	local grantedRewards = {}
 	local syncData = {}
@@ -624,6 +817,10 @@ local function grantRewards(userId, mission)
 			rewardResult = grantBaconReward(userId, reward, syncData)
 		elseif rewardType == "shop_item" then
 			rewardResult = grantShopItemReward(userId, reward, syncData)
+		elseif rewardType == "shop_unlock" then
+			rewardResult = grantShopUnlockReward(userId, reward, syncData)
+		elseif rewardType == "prestige_level" then
+			rewardResult = grantPrestigeLevelReward(userId, reward, syncData)
 		else
 			rewardResult = {
 				type = tostring(rewardType),
@@ -646,6 +843,56 @@ local function buildProgress(profile, mission)
 	local progressCfg = mission.progress
 	if type(progressCfg) ~= "table" then
 		return nil
+	end
+
+	if #progressCfg > 0 then
+		local rows = {}
+		local minPercent = 1
+		local completedObjectives = 0
+
+		for _, rowCfg in ipairs(progressCfg) do
+			if type(rowCfg) == "table" and type(rowCfg.path) == "string" then
+				local target = tonumber(rowCfg.target) or 1
+				local rawCurrent = readPath(profile, rowCfg.path)
+				local current = 0
+
+				if type(rawCurrent) == "number" then
+					current = rawCurrent
+				elseif type(rawCurrent) == "boolean" then
+					current = if rawCurrent then 1 else 0
+				end
+
+				local percent
+				if target <= 0 then
+					percent = 1
+				else
+					percent = math.clamp(current / target, 0, 1)
+				end
+
+				if percent >= 1 then
+					completedObjectives += 1
+				end
+				minPercent = math.min(minPercent, percent)
+
+				table.insert(rows, {
+					label = rowCfg.label or rowCfg.path,
+					current = current,
+					target = target,
+					percent = percent,
+				})
+			end
+		end
+
+		if #rows == 0 then
+			return nil
+		end
+
+		return {
+			current = completedObjectives,
+			target = #rows,
+			percent = minPercent,
+			rows = rows,
+		}
 	end
 
 	local target = tonumber(progressCfg.target) or 1
@@ -672,22 +919,29 @@ local function buildProgress(profile, mission)
 	}
 end
 
-local function buildClientState(profile)
+local function buildClientState(profile, userId)
 	local missions = {}
+	local order = 0
 
-	for index, mission in ipairs(MissionConfig.MISSIONS) do
+	for _, mission in ipairs(getMissionDefsForUser(userId)) do
+		order += 1
 		local completedAt = profile.completed[mission.id]
 		local completed = completedAt ~= nil
+		local redeemedAt = profile.redeemed[mission.id]
+		local redeemed = redeemedAt ~= nil
 		local unlocked = completed or requirementsMet(profile, mission)
 
 		table.insert(missions, {
 			id = mission.id,
 			title = mission.title,
 			description = mission.description,
-			order = index,
+			order = order,
 			unlocked = unlocked,
 			completed = completed,
 			completedAt = completedAt,
+			redeemed = redeemed,
+			redeemedAt = redeemedAt,
+			canRedeem = completed and not redeemed,
 			rewards = mission.rewards or {},
 			progress = buildProgress(profile, mission),
 		})
@@ -702,27 +956,24 @@ end
 
 local function evaluateMissions(userId, profile)
 	local completions = {}
-	local syncData = {}
 
-	for _, mission in ipairs(MissionConfig.MISSIONS) do
+	for _, mission in ipairs(getMissionDefsForUser(userId)) do
 		if not profile.completed[mission.id] then
-			if requirementsMet(profile, mission) and evaluateCondition(mission.condition, profile) then
+			if requirementsMet(profile, mission) and ConditionEvaluator.evaluate(mission.condition, profile) then
 				profile.completed[mission.id] = os.time()
-
-				local grantedRewards, rewardSync = grantRewards(userId, mission)
-				mergeSyncData(syncData, rewardSync)
 
 				table.insert(completions, {
 					missionId = mission.id,
 					title = mission.title,
 					description = mission.description,
-					rewards = grantedRewards,
+					rewards = mission.rewards or {},
+					redeemRequired = true,
 				})
 			end
 		end
 	end
 
-	return completions, syncData
+	return completions, {}
 end
 
 local function fireStateUpdated(player, profile, newlyCompleted, syncData)
@@ -731,9 +982,92 @@ local function fireStateUpdated(player, profile, newlyCompleted, syncData)
 	end
 
 	stateUpdatedRemote:FireClient(player, {
-		state = buildClientState(profile),
+		state = buildClientState(profile, player.UserId),
 		newlyCompleted = newlyCompleted or {},
 		sync = syncData or {},
+	})
+end
+
+local function buildRedeemResponse(player, profile, success, reason, newlyCompleted, syncData, redeemedPayload)
+	return {
+		success = success == true,
+		reason = reason,
+		state = buildClientState(profile, player.UserId),
+		newlyCompleted = newlyCompleted or {},
+		sync = syncData or {},
+		redeemed = redeemedPayload,
+	}
+end
+
+local function isPrestigeReward(reward)
+	return type(reward) == "table" and reward.type == "prestige_level"
+end
+
+local function isPrestigeProgressionMission(mission)
+	if type(mission) ~= "table" then
+		return false
+	end
+
+	for _, reward in ipairs(mission.rewards or {}) do
+		if isPrestigeReward(reward) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function redeemMission(player, missionId)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return {
+			success = false,
+			reason = "Invalid player",
+		}
+	end
+
+	if type(missionId) ~= "string" or missionId == "" then
+		return {
+			success = false,
+			reason = "Invalid mission",
+		}
+	end
+
+	local userId = player.UserId
+	local profile = loadProfile(userId)
+	local newlyCompleted, completionSync = evaluateMissions(userId, profile)
+	local syncData = {}
+	mergeSyncData(syncData, completionSync)
+
+	if #newlyCompleted > 0 then
+		markProfileDirty(userId)
+		queueCompletionSave(userId)
+	end
+
+	local mission = findMissionDefForUser(userId, missionId)
+	if not mission then
+		return buildRedeemResponse(player, profile, false, "Mission unavailable", newlyCompleted, syncData, nil)
+	end
+
+	if not profile.completed[missionId] then
+		return buildRedeemResponse(player, profile, false, "Mission not complete", newlyCompleted, syncData, nil)
+	end
+
+	if profile.redeemed[missionId] then
+		return buildRedeemResponse(player, profile, false, "Already redeemed", newlyCompleted, syncData, nil)
+	end
+
+	local grantedRewards, rewardSync = grantRewards(userId, mission)
+	mergeSyncData(syncData, rewardSync)
+
+	profile.redeemed[missionId] = os.time()
+	markProfileDirty(userId)
+	queueCompletionSave(userId)
+
+	return buildRedeemResponse(player, profile, true, nil, newlyCompleted, syncData, {
+		missionId = mission.id,
+		title = mission.title,
+		description = mission.description,
+		rewards = grantedRewards,
 	})
 end
 
@@ -775,6 +1109,18 @@ local function processEvent(player, eventName, payload, source)
 		end
 	end
 
+	if eventName == "score_progress" or eventName == "run_finished" then
+		if applyScoreThresholdTrackers(profile, safePayload) then
+			changed = true
+		end
+	end
+
+	if eventName == "run_finished" then
+		if applyPrestigeMissionTrackers(userId, profile, safePayload) then
+			changed = true
+		end
+	end
+
 	local newlyCompleted, syncData = evaluateMissions(userId, profile)
 	if changed or #newlyCompleted > 0 then
 		markProfileDirty(userId)
@@ -795,7 +1141,7 @@ end
 
 --[[
 	Injects service dependencies used for rewards.
-	@param deps table? { currencyService = module, shopService = module }
+	@param deps table? { currencyService = module, shopService = module, prestigeService = module }
 ]]
 function MissionService.setDependencies(deps)
 	if type(deps) ~= "table" then
@@ -803,6 +1149,7 @@ function MissionService.setDependencies(deps)
 	end
 	currencyService = deps.currencyService or currencyService
 	shopService = deps.shopService or shopService
+	prestigeService = deps.prestigeService or prestigeService
 end
 
 --[[
@@ -814,6 +1161,137 @@ function MissionService.reportServerEvent(player, eventName, payload)
 		return
 	end
 	processEvent(player, eventName, payload, "server")
+end
+
+--[[
+	Forces a mission state push to the client using the latest dynamic mission set.
+	Used after prestige level changes so the prestige mission list swaps to the new tier
+	immediately instead of showing stale completed missions from the previous tier.
+]]
+function MissionService.refreshStateForPlayer(player)
+	if not initialized then
+		return false, "Not initialized"
+	end
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return false, "Invalid player"
+	end
+
+	local userId = player.UserId
+	local profile = loadProfile(userId)
+	fireStateUpdated(player, profile, {}, {})
+	return true
+end
+
+--[[
+	Marks the currently-active prestige missions as completed + redeemed.
+	Called when the player successfully clicks Prestige in PrestigeUI.
+	This intentionally happens outside the Missions UI redeem flow.
+]]
+function MissionService.completeCurrentPrestigeMissionsForPlayer(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return false, "Invalid player"
+	end
+
+	local userId = player.UserId
+	local profile = loadProfile(userId)
+	local syncData = {}
+	local changed = false
+
+	for _, mission in ipairs(getDynamicPrestigeMissions(userId)) do
+		if isPrestigeProgressionMission(mission) then
+			if not profile.completed[mission.id] then
+				profile.completed[mission.id] = os.time()
+				changed = true
+			end
+
+			if not profile.redeemed[mission.id] then
+				local _, rewardSync = grantRewards(userId, mission)
+				mergeSyncData(syncData, rewardSync)
+				profile.redeemed[mission.id] = os.time()
+				changed = true
+
+				-- Prestige missions route through PrestigeUI and are auto-completed
+				-- on prestige click. Rewards (currently display-only prestige_level
+				-- + optional future extras) are still granted server-side above.
+			end
+		end
+	end
+
+	if not changed then
+		return true
+	end
+
+	markProfileDirty(userId)
+	queueCompletionSave(userId)
+	fireStateUpdated(player, profile, {}, syncData)
+
+	return true
+end
+
+--[[
+	Returns whether a mission reward has been redeemed for the given user.
+	Used by ShopService for mission-gated purchase validation.
+]]
+function MissionService.isMissionCompleted(userId, missionId)
+	if type(userId) ~= "number" or type(missionId) ~= "string" then
+		return false
+	end
+
+	local profile = loadProfile(userId)
+	if type(profile) ~= "table" or type(profile.redeemed) ~= "table" then
+		return false
+	end
+
+	return profile.redeemed[missionId] ~= nil
+end
+
+--[[
+	Debug-only helper: resets a player's mission profile (stats/flags/completions).
+	@param playerOrUserId Player|number
+	@return boolean success, string? err
+]]
+function MissionService.debugResetPlayer(playerOrUserId)
+	local userId = nil
+	local player = nil
+	if typeof(playerOrUserId) == "Instance" and playerOrUserId:IsA("Player") then
+		player = playerOrUserId
+		userId = player.UserId
+	else
+		userId = tonumber(playerOrUserId)
+		if userId then
+			player = Players:GetPlayerByUserId(userId)
+		end
+	end
+
+	if not userId then
+		return false, "Invalid player/userId"
+	end
+
+	cancelQueuedCompletionSave(userId)
+	local profile = createDefaultProfile()
+	cachedProfiles[userId] = profile
+	dirtyProfiles[userId] = nil
+	eventCooldowns[userId] = nil
+	runActiveByUser[userId] = false
+	queuedCompletionSaves[userId] = nil
+	queuedCompletionSaveTokens[userId] = nil
+	exitSaveStarted[userId] = nil
+
+	if dataStoreAvailable and missionDataStore then
+		local ok, err = pcall(function()
+			missionDataStore:RemoveAsync(profileKeyForUser(userId))
+		end)
+		if not ok then
+			warn("[MissionService] Failed to reset mission data for user " .. userId .. ": " .. tostring(err))
+			return false, tostring(err)
+		end
+	end
+
+	if player then
+		fireStateUpdated(player, profile, {}, {})
+	end
+
+	return true
 end
 
 function MissionService.init(deps)
@@ -852,6 +1330,13 @@ function MissionService.init(deps)
 		stateUpdatedRemote.Parent = remoteFolder
 	end
 
+	redeemMissionRemote = remoteFolder:FindFirstChild(MissionConfig.REMOTES.REDEEM)
+	if not redeemMissionRemote then
+		redeemMissionRemote = Instance.new("RemoteFunction")
+		redeemMissionRemote.Name = MissionConfig.REMOTES.REDEEM
+		redeemMissionRemote.Parent = remoteFolder
+	end
+
 	getStateRemote.OnServerInvoke = function(player)
 		local profile = loadProfile(player.UserId)
 		local newlyCompleted, syncData = evaluateMissions(player.UserId, profile)
@@ -860,7 +1345,7 @@ function MissionService.init(deps)
 			queueCompletionSave(player.UserId)
 		end
 		return {
-			state = buildClientState(profile),
+			state = buildClientState(profile, player.UserId),
 			newlyCompleted = newlyCompleted,
 			sync = syncData,
 		}
@@ -869,6 +1354,10 @@ function MissionService.init(deps)
 	reportEventRemote.OnServerEvent:Connect(function(player, eventName, payload)
 		processEvent(player, eventName, payload, "client")
 	end)
+
+	redeemMissionRemote.OnServerInvoke = function(player, missionId)
+		return redeemMission(player, missionId)
+	end
 
 	Players.PlayerAdded:Connect(function(player)
 		task.spawn(function()

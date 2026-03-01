@@ -17,6 +17,7 @@ local CurrencyConfig = require(ReplicatedStorage.Shared.CurrencyConfig)
 local ShopConfig = require(ReplicatedStorage.Shared.ShopConfig)
 
 local MissionManager = require(script.Parent.MissionManager)
+local CurrencyUI = require(script.Parent.CurrencyUI)
 
 local MissionsUI = {}
 
@@ -24,10 +25,13 @@ local localPlayer = Players.LocalPlayer
 local screenGui = nil
 local onCloseCallback = nil
 local latestState = nil
+local missionActionRouter = nil
+local routeRequestCallback = nil
 
 local listFrame = nil
 local listLayout = nil
 local summaryLabel = nil
+local animationLayer = nil
 local uiScaleInstance = nil
 local viewportScaleConnection = nil
 local canvasPositionConnection = nil
@@ -35,6 +39,8 @@ local isDestroyed = false
 local bottomRubberbandTween = nil
 local bottomRubberbandScheduled = false
 local wasPastBottomRest = false
+local redeemingMissionIds = {}
+local activeCelebrationTweens = {}
 
 local UI = MissionConfig.UI
 local BOTTOM_OVERSCROLL_SLIVER = 8
@@ -42,6 +48,19 @@ local BOTTOM_RUBBERBAND_DELAY = 0.05
 local BOTTOM_RUBBERBAND_DURATION = 0.12
 
 local updateListCanvasSize = nil
+
+local function resolveMissionPrimaryAction(mission)
+	if mission and mission.canRedeem == true and type(missionActionRouter) == "function" then
+		local ok, action = pcall(missionActionRouter, mission)
+		if ok and type(action) == "table" and action.kind == "route" and type(action.routeId) == "string" then
+			return action
+		end
+	end
+
+	return {
+		kind = "redeem",
+	}
+end
 
 local function getCurrentUIScale()
 	if not uiScaleInstance then
@@ -74,6 +93,9 @@ local function missionPercent(mission)
 end
 
 local function missionStatus(mission)
+	if mission.canRedeem == true then
+		return "Redeem"
+	end
 	if mission.completed then
 		return "Completed"
 	end
@@ -85,9 +107,13 @@ end
 
 local function missionSortGroup(mission)
 	-- Sort buckets:
+	-- 0) Completed but unredeemed (Redeem)
 	-- 1) In Progress
 	-- 2) Locked
-	-- 3) Completed
+	-- 3) Completed + redeemed
+	if mission.canRedeem == true then
+		return 0
+	end
 	if mission.completed then
 		return 3
 	end
@@ -105,10 +131,17 @@ local function rewardTextForMission(mission)
 	for _, reward in ipairs(rewards) do
 		if reward.type == "bacon" then
 			table.insert(rewardParts, string.format("%d %s", reward.amount or 0, baconIcon))
+		elseif reward.type == "prestige_level" then
+			local level = math.max(1, math.floor(tonumber(reward.level) or 1))
+			table.insert(rewardParts, string.format("Prestige %d", level))
 		elseif reward.type == "shop_item" then
 			local item = ShopConfig.getItem(reward.itemId)
 			local name = if item and item.name then item.name else tostring(reward.itemId)
 			table.insert(rewardParts, "Unlock " .. name)
+		elseif reward.type == "shop_unlock" then
+			local item = ShopConfig.getItem(reward.itemId)
+			local name = if item and item.name then item.name else tostring(reward.itemId)
+			table.insert(rewardParts, "Shop Unlock: " .. name)
 		end
 	end
 
@@ -120,6 +153,10 @@ local function rewardTextForMission(mission)
 end
 
 local function progressTextForMission(mission, percent)
+	if mission.canRedeem == true then
+		return "Ready to redeem!"
+	end
+
 	if mission.completed then
 		return "Completed (100%)"
 	end
@@ -128,12 +165,198 @@ local function progressTextForMission(mission, percent)
 	local percentInt = math.floor(percent * 100 + 0.5)
 
 	if progress then
+		local rows = progress.rows
+		if type(rows) == "table" and #rows > 1 then
+			local completedObjectives = 0
+			for _, row in ipairs(rows) do
+				if (tonumber(row and row.percent) or 0) >= 1 then
+					completedObjectives += 1
+				end
+			end
+			return string.format("Progress: %d / %d objectives (%d%%)", completedObjectives, #rows, percentInt)
+		end
+
 		local current = math.floor(tonumber(progress.current) or 0)
 		local target = math.max(1, math.floor(tonumber(progress.target) or 1))
 		return string.format("Progress: %d / %d (%d%%)", current, target, percentInt)
 	end
 
 	return string.format("Progress: %d%%", percentInt)
+end
+
+local function removeCelebrationEntry(entry)
+	for i, active in ipairs(activeCelebrationTweens) do
+		if active == entry then
+			table.remove(activeCelebrationTweens, i)
+			break
+		end
+	end
+end
+
+local function cleanupCelebrationEntry(entry)
+	if not entry or entry.cleaned then
+		return
+	end
+	entry.cleaned = true
+
+	if entry.tween then
+		entry.tween:Cancel()
+		entry.tween = nil
+	end
+
+	if entry.element and entry.element.Parent then
+		entry.element:Destroy()
+	end
+	entry.element = nil
+
+	removeCelebrationEntry(entry)
+end
+
+local function cancelCelebrationTweens()
+	for _, entry in ipairs(activeCelebrationTweens) do
+		if entry.tween then
+			entry.tween:Cancel()
+		end
+		if entry.element and entry.element.Parent then
+			entry.element:Destroy()
+		end
+	end
+	table.clear(activeCelebrationTweens)
+end
+
+local function rectCenter(position, size)
+	return Vector2.new(position.X + size.X * 0.5, position.Y + size.Y * 0.5)
+end
+
+local function getRedeemTargetRect()
+	local targetPos, targetSize = nil, nil
+	if CurrencyUI.getBalanceBillboardScreenRect then
+		targetPos, targetSize = CurrencyUI.getBalanceBillboardScreenRect()
+	end
+	if targetPos and targetSize and targetSize.X > 0 and targetSize.Y > 0 then
+		return targetPos, targetSize
+	end
+
+	local fallbackPos, fallbackSize = CurrencyUI.getBalanceLabelPosition()
+	if fallbackPos and fallbackSize and fallbackSize.X > 0 and fallbackSize.Y > 0 then
+		return fallbackPos, fallbackSize
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil, nil
+	end
+
+	return Vector2.new(camera.ViewportSize.X * 0.5 - 40, 18), Vector2.new(80, 24)
+end
+
+local function getRewardBaconAmount(rewards)
+	local total = 0
+	for _, reward in ipairs(rewards or {}) do
+		if type(reward) == "table" then
+			if reward.type == "bacon" and reward.granted ~= false then
+				total += math.max(0, math.floor(tonumber(reward.amount) or 0))
+			elseif reward.convertedToBacon then
+				total += math.max(0, math.floor(tonumber(reward.convertedToBacon) or 0))
+			end
+		end
+	end
+	return total
+end
+
+local function playRedeemCelebration(sourcePosition, sourceSize, rewards)
+	if not animationLayer or not screenGui then
+		return
+	end
+
+	local targetPos, targetSize = getRedeemTargetRect()
+	if not targetPos or not targetSize then
+		return
+	end
+
+	local sourceCenter = rectCenter(sourcePosition, sourceSize)
+	local targetCenter = rectCenter(targetPos, targetSize)
+	local uiIcon = (CurrencyConfig.UI and CurrencyConfig.UI.ICON) or CurrencyConfig.NAME
+	local baconReward = getRewardBaconAmount(rewards)
+	local burstCount = math.clamp(6 + math.floor(baconReward / 30), 6, 16)
+	local rng = Random.new()
+
+	for i = 1, burstCount do
+		local element = Instance.new("TextLabel")
+		element.Name = "RedeemBaconBurst"
+		element.AnchorPoint = Vector2.new(0.5, 0.5)
+		element.Size = UDim2.new(0, 22, 0, 22)
+		element.Position = UDim2.new(0, sourceCenter.X, 0, sourceCenter.Y)
+		element.BackgroundTransparency = 1
+		element.Text = uiIcon
+		element.TextScaled = true
+		element.Font = Enum.Font.GothamBold
+		element.TextColor3 = Color3.new(1, 1, 1)
+		element.ZIndex = 40
+		element.Parent = animationLayer
+
+		local entry = {
+			element = element,
+			tween = nil,
+			cleaned = false,
+		}
+		table.insert(activeCelebrationTweens, entry)
+
+		local angle = ((i - 1) / burstCount) * (math.pi * 2) + rng:NextNumber(-0.25, 0.25)
+		local popRadius = rng:NextNumber(18, 42)
+		local popX = sourceCenter.X + math.cos(angle) * popRadius
+		local popY = sourceCenter.Y + math.sin(angle) * popRadius
+		local popSize = rng:NextInteger(20, 30)
+		local flyDelay = rng:NextNumber(0.02, 0.10)
+		local finalSize = rng:NextInteger(8, 12)
+
+		local popTween = TweenService:Create(
+			element,
+			TweenInfo.new(0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{
+				Position = UDim2.new(0, popX, 0, popY),
+				Size = UDim2.new(0, popSize, 0, popSize),
+				Rotation = rng:NextInteger(-20, 20),
+			}
+		)
+		entry.tween = popTween
+
+		popTween.Completed:Connect(function(playbackState)
+			if entry.cleaned then
+				return
+			end
+			if playbackState ~= Enum.PlaybackState.Completed then
+				cleanupCelebrationEntry(entry)
+				return
+			end
+
+			task.delay(flyDelay, function()
+				if entry.cleaned or isDestroyed or not element.Parent then
+					cleanupCelebrationEntry(entry)
+					return
+				end
+
+				local flyTween = TweenService:Create(
+					element,
+					TweenInfo.new(0.34 + rng:NextNumber(0, 0.14), Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+					{
+						Position = UDim2.new(0, targetCenter.X, 0, targetCenter.Y),
+						Size = UDim2.new(0, finalSize, 0, finalSize),
+						Rotation = rng:NextInteger(-35, 35),
+						TextTransparency = 0.05,
+					}
+				)
+				entry.tween = flyTween
+
+				flyTween.Completed:Connect(function()
+					cleanupCelebrationEntry(entry)
+				end)
+				flyTween:Play()
+			end)
+		end)
+
+		popTween:Play()
+	end
 end
 
 local function clearCards()
@@ -240,7 +463,9 @@ local function renderMissions()
 	local missions = {}
 	if latestState and latestState.missions then
 		for _, mission in ipairs(latestState.missions) do
-			table.insert(missions, mission)
+			if not MissionManager.isPrestigeMission(mission) then
+				table.insert(missions, mission)
+			end
 		end
 	end
 
@@ -288,11 +513,12 @@ local function renderMissions()
 	end
 
 	for _, mission in ipairs(missions) do
+		local missionId = mission.id
 		local percent = missionPercent(mission)
 		local status = missionStatus(mission)
 
 		local card = Instance.new("Frame")
-		card.Name = "Mission_" .. tostring(mission.id)
+		card.Name = "Mission_" .. tostring(missionId)
 		card.Size = UDim2.new(1, -12, 0, UI.CARD_HEIGHT)
 		card.BorderSizePixel = 0
 		if status == "Completed" then
@@ -321,22 +547,86 @@ local function renderMissions()
 		title.TextTruncate = Enum.TextTruncate.AtEnd
 		title.Parent = card
 
-		local statusLabel = Instance.new("TextLabel")
-		statusLabel.Name = "Status"
-		statusLabel.Size = UDim2.new(0, 110, 0, 22)
-		statusLabel.Position = UDim2.new(1, -118, 0, 9)
-		statusLabel.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-		statusLabel.BackgroundTransparency = 0.3
-		statusLabel.BorderSizePixel = 0
-		statusLabel.Text = status
-		statusLabel.Font = UI.STATUS_FONT
-		statusLabel.TextSize = UI.STATUS_SIZE
-		statusLabel.TextColor3 = Color3.fromRGB(245, 245, 245)
-		statusLabel.Parent = card
+		local isClaimable = mission.canRedeem == true
+		local isRedeeming = isClaimable and redeemingMissionIds[missionId] == true
+		local statusChip
+		if isClaimable then
+			statusChip = Instance.new("TextButton")
+		else
+			statusChip = Instance.new("TextLabel")
+		end
+		statusChip.Name = "Status"
+		statusChip.Size = UDim2.new(0, 110, 0, 22)
+		statusChip.Position = UDim2.new(1, -118, 0, 9)
+		statusChip.BorderSizePixel = 0
+		statusChip.Font = UI.STATUS_FONT
+		statusChip.TextSize = UI.STATUS_SIZE
+		statusChip.TextColor3 = Color3.fromRGB(245, 245, 245)
+		if isClaimable then
+			statusChip.Text = if isRedeeming then "Redeeming..." else "Redeem"
+			statusChip.BackgroundColor3 = if isRedeeming then Color3.fromRGB(58, 105, 67) else Color3.fromRGB(52, 176, 79)
+			statusChip.BackgroundTransparency = if isRedeeming then 0.12 else 0.02
+			statusChip.AutoButtonColor = not isRedeeming
+			statusChip.Active = not isRedeeming
+			statusChip.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			statusChip.Text = status
+			statusChip.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+			statusChip.BackgroundTransparency = 0.3
+		end
+		statusChip.Parent = card
 
 		local statusCorner = Instance.new("UICorner")
 		statusCorner.CornerRadius = UDim.new(0, 6)
-		statusCorner.Parent = statusLabel
+		statusCorner.Parent = statusChip
+
+		if isClaimable then
+			statusChip.Activated:Connect(function()
+				if isDestroyed or redeemingMissionIds[missionId] == true then
+					return
+				end
+
+				local action = resolveMissionPrimaryAction(mission)
+				if action.kind == "route" then
+					MissionsUI.hide()
+					if routeRequestCallback then
+						task.spawn(routeRequestCallback, action.routeId, {
+							missionId = missionId,
+							mission = mission,
+							action = action,
+						})
+					end
+					return
+				end
+
+				local sourcePos = statusChip.AbsolutePosition
+				local sourceSize = statusChip.AbsoluteSize
+				redeemingMissionIds[missionId] = true
+
+				if screenGui and screenGui.Enabled then
+					renderMissions()
+				end
+
+				task.spawn(function()
+					local success, redeemResultOrReason = MissionManager.redeemMission(missionId)
+					redeemingMissionIds[missionId] = nil
+
+					if success then
+						local redeemedPayload = redeemResultOrReason
+						playRedeemCelebration(sourcePos, sourceSize, redeemedPayload and redeemedPayload.rewards)
+					else
+						warn(string.format("[MissionsUI] Failed to redeem mission '%s': %s", tostring(missionId), tostring(redeemResultOrReason)))
+					end
+
+					if isDestroyed then
+						return
+					end
+					if screenGui and screenGui.Enabled then
+						renderMissions()
+					end
+				end)
+			end)
+		end
 
 		local howLabel = Instance.new("TextLabel")
 		howLabel.Name = "How"
@@ -439,6 +729,15 @@ function MissionsUI.init()
 	local containerCorner = Instance.new("UICorner")
 	containerCorner.CornerRadius = UI.CONTAINER_CORNER_RADIUS
 	containerCorner.Parent = container
+
+	animationLayer = Instance.new("Frame")
+	animationLayer.Name = "AnimationLayer"
+	animationLayer.Size = UDim2.new(1, 0, 1, 0)
+	animationLayer.BackgroundTransparency = 1
+	animationLayer.BorderSizePixel = 0
+	animationLayer.Active = false
+	animationLayer.ZIndex = 30
+	animationLayer.Parent = screenGui
 
 	uiScaleInstance = Instance.new("UIScale")
 	uiScaleInstance.Parent = container
@@ -572,16 +871,42 @@ function MissionsUI.setOnClose(callback)
 	onCloseCallback = callback
 end
 
+--[[
+	Configures a primary-action resolver for claimable missions.
+	Return `{ kind = "route", routeId = "..." }` to route instead of redeeming.
+	Any other return falls back to direct redeem.
+]]
+function MissionsUI.setMissionActionRouter(callback)
+	if type(callback) == "function" then
+		missionActionRouter = callback
+	else
+		missionActionRouter = nil
+	end
+end
+
+--[[
+	Receives route intents emitted by the mission action router.
+	Used by GameController to open other modals (PrestigeUI, ShopUI, etc.).
+]]
+function MissionsUI.setOnRouteRequest(callback)
+	routeRequestCallback = if type(callback) == "function" then callback else nil
+end
+
 function MissionsUI.destroy()
 	isDestroyed = true
 	onCloseCallback = nil
 	latestState = nil
+	missionActionRouter = nil
+	routeRequestCallback = nil
 	listFrame = nil
 	listLayout = nil
 	summaryLabel = nil
+	animationLayer = nil
 	wasPastBottomRest = false
 
 	cancelBottomRubberband()
+	cancelCelebrationTweens()
+	table.clear(redeemingMissionIds)
 
 	if viewportScaleConnection then
 		viewportScaleConnection:Disconnect()

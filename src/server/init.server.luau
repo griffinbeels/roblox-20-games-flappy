@@ -6,6 +6,8 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local PrestigeConfig = require(ReplicatedStorage.Shared.PrestigeConfig)
 
 -- Disable auto-respawn so the client controls when characters spawn.
 -- This lets the game over screen stay visible until the player chooses to restart.
@@ -39,16 +41,187 @@ if not toggleDebugCamera then
 	toggleDebugCamera.Parent = remotes
 end
 
--- Wire /debugcam chat listener for a single player
-local function wireDebugCamChat(player)
-	player.Chatted:Connect(function(message)
-		if string.lower(message) == "/debugcam" then
-			toggleDebugCamera:FireClient(player)
+-- ToggleSpeedDebugLog: server fires this to toggle/force the client-side
+-- once-per-second speed log in the output console (Studio playtesting).
+local toggleSpeedDebugLog = remotes:FindFirstChild("ToggleSpeedDebugLog")
+if not toggleSpeedDebugLog then
+	toggleSpeedDebugLog = Instance.new("RemoteEvent")
+	toggleSpeedDebugLog.Name = "ToggleSpeedDebugLog"
+	toggleSpeedDebugLog.Parent = remotes
+end
+
+-- DebugProgressReset: server fires this after a debug reset so the client can
+-- refresh cached shop/mission/prestige/currency/score state in the same session.
+local debugProgressReset = remotes:FindFirstChild("DebugProgressReset")
+if not debugProgressReset then
+	debugProgressReset = Instance.new("RemoteEvent")
+	debugProgressReset.Name = "DebugProgressReset"
+	debugProgressReset.Parent = remotes
+end
+
+local DEBUG_COMMANDS_ENABLED = RunService:IsStudio()
+
+local LeaderboardService = nil
+local CurrencyService = nil
+local ShopService = nil
+local MissionService = nil
+local PrestigeService = nil
+
+local lastRespawnTime = {} -- per-player cooldown to prevent spam
+
+local function normalizeChatCommand(message)
+	if type(message) ~= "string" then
+		return ""
+	end
+
+	local trimmed = string.gsub(message, "^%s+", "")
+	trimmed = string.gsub(trimmed, "%s+$", "")
+	return string.lower(trimmed)
+end
+
+local function debugResetService(serviceName, service, player)
+	if not service or type(service.debugResetPlayer) ~= "function" then
+		return false, serviceName .. " unavailable"
+	end
+
+	local ok, successOrErr, errMaybe = pcall(function()
+		return service.debugResetPlayer(player)
+	end)
+	if not ok then
+		return false, serviceName .. " reset errored: " .. tostring(successOrErr)
+	end
+	if successOrErr == false then
+		return false, serviceName .. " reset failed: " .. tostring(errMaybe or "unknown")
+	end
+
+	return true, nil
+end
+
+local function respawnPlayerForReset(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return
+	end
+
+	task.defer(function()
+		if player.Parent == Players then
+			player:LoadCharacter()
 		end
 	end)
 end
 
-local lastRespawnTime = {} -- per-player cooldown to prevent spam
+local function resetPrestigeForPlayer(player)
+	if DEBUG_COMMANDS_ENABLED ~= true then
+		return
+	end
+
+	local errors = {}
+	if PrestigeConfig.ENABLED == true then
+		local ok, err = debugResetService("PrestigeService", PrestigeService, player)
+		if not ok then
+			table.insert(errors, err)
+		end
+	end
+
+	debugProgressReset:FireClient(player, {
+		mode = "prestige",
+		success = #errors == 0,
+		errors = errors,
+	})
+	respawnPlayerForReset(player)
+
+	if #errors == 0 then
+		print(string.format("[DebugReset] Reset prestige for %s (%d).", player.Name, player.UserId))
+	else
+		warn(string.format("[DebugReset] Prestige reset completed with issues for %s: %s", player.Name, table.concat(errors, " | ")))
+	end
+end
+
+local function resetAllProgressForPlayer(player)
+	if DEBUG_COMMANDS_ENABLED ~= true then
+		return
+	end
+
+	local errors = {}
+
+	local function runReset(serviceName, service)
+		local ok, err = debugResetService(serviceName, service, player)
+		if not ok then
+			table.insert(errors, err)
+		end
+	end
+
+	runReset("LeaderboardService", LeaderboardService)
+	runReset("CurrencyService", CurrencyService)
+	runReset("ShopService", ShopService)
+	if PrestigeConfig.ENABLED == true then
+		runReset("PrestigeService", PrestigeService)
+	end
+	runReset("MissionService", MissionService)
+
+	debugProgressReset:FireClient(player, {
+		mode = "all",
+		success = #errors == 0,
+		errors = errors,
+	})
+	respawnPlayerForReset(player)
+
+	if #errors == 0 then
+		print(string.format("[DebugReset] Reset ALL progress for %s (%d).", player.Name, player.UserId))
+	else
+		warn(string.format("[DebugReset] All-progress reset completed with issues for %s: %s", player.Name, table.concat(errors, " | ")))
+	end
+end
+
+local function wireDebugChatCommands(player)
+	player.Chatted:Connect(function(message)
+		local cmd = normalizeChatCommand(message)
+		if cmd == "" then
+			return
+		end
+
+		if cmd == "/debugcam" then
+			toggleDebugCamera:FireClient(player)
+			return
+		end
+
+		if DEBUG_COMMANDS_ENABLED ~= true then
+			return
+		end
+
+		if cmd == "/resetprestige" or cmd == "/prestigereset" or cmd == "/resetprogress prestige" then
+			resetPrestigeForPlayer(player)
+			return
+		end
+
+		if cmd == "/debugspeed" or cmd == "/speeddebug" or cmd == "/speedlog" then
+			toggleSpeedDebugLog:FireClient(player, {
+				action = "toggle",
+			})
+			return
+		end
+
+		if cmd == "/debugspeed on" or cmd == "/speeddebug on" or cmd == "/speedlog on" then
+			toggleSpeedDebugLog:FireClient(player, {
+				action = "set",
+				enabled = true,
+			})
+			return
+		end
+
+		if cmd == "/debugspeed off" or cmd == "/speeddebug off" or cmd == "/speedlog off" then
+			toggleSpeedDebugLog:FireClient(player, {
+				action = "set",
+				enabled = false,
+			})
+			return
+		end
+
+		if cmd == "/resetallprogress" or cmd == "/resetprogress" or cmd == "/resetall" or cmd == "/resetprogress all" then
+			resetAllProgressForPlayer(player)
+			return
+		end
+	end)
+end
 
 requestRespawn.OnServerEvent:Connect(function(player)
 	local now = tick()
@@ -60,10 +233,10 @@ requestRespawn.OnServerEvent:Connect(function(player)
 end)
 
 -- Manually load character on join (since CharacterAutoLoads = false)
--- Also wire /debugcam chat listener
+-- Also wire debug chat commands
 Players.PlayerAdded:Connect(function(player)
 	player:LoadCharacter()
-	wireDebugCamChat(player)
+	wireDebugChatCommands(player)
 end)
 
 -- Clean up cooldown tracking on leave
@@ -73,18 +246,13 @@ end)
 
 -- Handle players already in the game (Studio fast-start)
 for _, player in ipairs(Players:GetPlayers()) do
-	wireDebugCamChat(player)
+	wireDebugChatCommands(player)
 	if not player.Character then
 		task.spawn(function()
 			player:LoadCharacter()
 		end)
 	end
 end
-
-local LeaderboardService = nil
-local CurrencyService = nil
-local ShopService = nil
-local MissionService = nil
 
 local leaderboardRequireOk, leaderboardModule = pcall(function()
 	return require(script.LeaderboardService)
@@ -173,6 +341,43 @@ if missionRequireOk and missionModule then
 	end
 else
 	warn("Failed to require MissionService:", missionModule)
+end
+
+if ShopService and ShopService.setDependencies and MissionService then
+	ShopService.setDependencies({
+		missionService = MissionService,
+	})
+end
+
+-- Initialize PrestigeService for prestige progression + tuning (config gated)
+if PrestigeConfig.ENABLED == true then
+	local prestigeRequireOk, prestigeModule = pcall(function()
+		return require(script.PrestigeService)
+	end)
+	if prestigeRequireOk and prestigeModule then
+		PrestigeService = prestigeModule
+		local prestigeInitOk, prestigeErr = pcall(function()
+			PrestigeService.init()
+		end)
+		if not prestigeInitOk then
+			warn("Failed to initialize PrestigeService:", prestigeErr)
+			PrestigeService = nil
+		end
+	else
+		warn("Failed to require PrestigeService:", prestigeModule)
+	end
+end
+
+if MissionService and MissionService.setDependencies and PrestigeService then
+	MissionService.setDependencies({
+		prestigeService = PrestigeService,
+	})
+end
+
+if PrestigeService and PrestigeService.setDependencies and MissionService then
+	PrestigeService.setDependencies({
+		missionService = MissionService,
+	})
 end
 
 -- Wire mission event reporters from trusted server services.

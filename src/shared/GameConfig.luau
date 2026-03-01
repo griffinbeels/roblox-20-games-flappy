@@ -25,8 +25,48 @@ GameConfig.RESET_DELAY = 0.5
 --============================================================================
 GameConfig.SPEED = {
 	INITIAL_MULTIPLIER = 1.0,
-	INCREASE_RATE = 0.25,    -- Speed increase per second
-	MAX_MULTIPLIER = 2.5,   -- Cap on speed increase
+	INCREASE_RATE = 0.001,      -- Legacy ramp (kept for compatibility; unified progression profile is used when enabled)
+	RAMP_RATE_MULTIPLIER_DEFAULT = 1.0, -- Default value for the user-facing "speed" tuning slider (legacy field: speedCapMultiplier)
+	MAX_MULTIPLIER = 2.5,      -- Legacy/exposed max for the user-facing speed ramp tuning range
+	INTERNAL_MULTIPLIER_CAP = 3.5, -- Legacy hidden multiplier cap (spacing/progression compatibility)
+	MAX_FORWARD_SPEED = 180, -- Absolute cap on final forward speed (studs/sec) after all scaling
+	PROGRESSION_PROFILE = {
+		ENABLED = true,
+
+		-- Unified speed curve: selected speed setting controls BOTH how fast the
+		-- run ramps and what the per-setting max speed is.
+		START_DELAY = 0, -- seconds before the unified speed curve begins advancing
+		EASING = "smoothstep", -- fallback easing when CURVE_POINTS is empty
+
+		-- Optional authored curve for game feel (0..1 time -> 0..1 progress).
+		-- This keeps the early run readable, ramps harder mid-run, and smooths
+		-- into the cap. If empty/nil, EASING is used instead.
+		CURVE_POINTS = {
+			{ t = 0.00, value = 0.00 },
+			{ t = 0.15, value = 0.08 },
+			{ t = 0.35, value = 0.28 },
+			{ t = 0.60, value = 0.60 },
+			{ t = 0.82, value = 0.88 },
+			{ t = 1.00, value = 1.00 },
+		},
+
+		-- Per-setting speed ceiling (actual forward speed target, studs/sec)
+		MIN_TARGET_SPEED = 80, -- when the selected speed setting is at the band's minimum
+		MAX_TARGET_SPEED = 180, -- when the selected speed setting is at the band's maximum
+		TARGET_SPEED_EXPONENT = 1.0, -- >1 gives more low-setting precision, <1 front-loads gains
+
+		-- Per-setting time to reach target (seconds)
+		MIN_TIME_TO_TARGET = 30, -- fastest/highest setting reaches target sooner
+		MAX_TIME_TO_TARGET = 60, -- slowest/lower setting takes longer
+		TIME_TO_TARGET_EXPONENT = 1.0,
+	},
+	CHALLENGE_FLOOR_RAMP = {
+		ENABLED = true,
+		START_DELAY = 0,       -- Legacy system (ignored while PROGRESSION_PROFILE.ENABLED = true)
+		DURATION = 120,         -- Legacy system (ignored while PROGRESSION_PROFILE.ENABLED = true)
+		EASING = "outCubic",    -- Legacy system (ignored while PROGRESSION_PROFILE.ENABLED = true)
+		TARGET_SPEED = 180,     -- Legacy system (ignored while PROGRESSION_PROFILE.ENABLED = true)
+	},
 }
 
 --============================================================================

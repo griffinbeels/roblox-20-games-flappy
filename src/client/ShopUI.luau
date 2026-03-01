@@ -72,6 +72,12 @@ local function refreshButtons()
 			btn.TextColor3 = UI.COMING_SOON_TEXT_COLOR
 			btn.AutoButtonColor = false
 			btn.TextSize = math.max(10, UI.BUTTON_SIZE - 2)
+		elseif state == "locked" then
+			btn.Text = UI.LOCKED_TEXT
+			btn.BackgroundColor3 = UI.LOCKED_COLOR
+			btn.TextColor3 = UI.LOCKED_TEXT_COLOR
+			btn.AutoButtonColor = false
+			btn.TextSize = math.max(11, UI.BUTTON_SIZE - 1)
 		elseif state == "equipped" then
 			btn.Text = "Equipped"
 			btn.BackgroundColor3 = UI.EQUIPPED_COLOR
@@ -85,7 +91,13 @@ local function refreshButtons()
 			btn.AutoButtonColor = true
 			btn.TextSize = UI.BUTTON_SIZE
 		elseif state == "buy" then
-			if item and balance >= item.price then
+			if item and item.price <= 0 then
+				btn.Text = "Unlock"
+				btn.BackgroundColor3 = UI.BUY_COLOR
+				btn.TextColor3 = UI.BUY_TEXT_COLOR
+				btn.AutoButtonColor = true
+				btn.TextSize = UI.BUTTON_SIZE
+			elseif item and balance >= item.price then
 				local uiCfg = CurrencyConfig.UI
 				btn.Text = uiCfg.ICON .. " " .. item.price
 				btn.BackgroundColor3 = UI.BUY_COLOR
@@ -213,7 +225,7 @@ local function createItemCard(item, parent)
 		elseif state == "equip" then
 			ShopManager.equip(item.id)
 		end
-		-- "equipped"/"comingSoon" states: do nothing (button is disabled)
+		-- "equipped"/"comingSoon"/"locked" states: do nothing (button is disabled)
 	end)
 
 	return card, btn
@@ -345,16 +357,21 @@ function ShopUI.init()
 	tabBar.BackgroundTransparency = 1
 	tabBar.Parent = container
 
+	local tabGap = 6
+	local tabCount = math.max(1, #ShopConfig.CATEGORIES)
+	local innerWidth = UI.CONTAINER_WIDTH - 20
+	local tabWidth = math.max(1, math.floor((innerWidth - ((tabCount - 1) * tabGap)) / tabCount))
+
 	local tabLayout = Instance.new("UIListLayout")
 	tabLayout.FillDirection = Enum.FillDirection.Horizontal
 	tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-	tabLayout.Padding = UDim.new(0, 6)
+	tabLayout.Padding = UDim.new(0, tabGap)
 	tabLayout.Parent = tabBar
 
 	for _, cat in ipairs(ShopConfig.CATEGORIES) do
 		local tab = Instance.new("TextButton")
 		tab.Name = "Tab_" .. cat.id
-		tab.Size = UDim2.new(0, 100, 1, 0)
+		tab.Size = UDim2.new(0, tabWidth, 1, 0)
 		tab.BackgroundColor3 = UI.TAB_INACTIVE_BG
 		tab.BorderSizePixel = 0
 		tab.Text = cat.label
@@ -430,6 +447,12 @@ function ShopUI.init()
 		refreshButtons()
 	end)
 
+	MissionManager.onStateChanged(function(state)
+		ShopManager.setMissionState(state)
+	end)
+
+	ShopManager.setMissionState(MissionManager.getState())
+
 	-- Select first category by default
 	if #ShopConfig.CATEGORIES > 0 then
 		switchCategory(ShopConfig.CATEGORIES[1].id)
@@ -441,9 +464,11 @@ end
 ]]
 function ShopUI.show()
 	if not screenGui then return end
+	ShopManager.setMissionState(MissionManager.getState())
 	refreshButtons()
 	screenGui.Enabled = true
 	MissionManager.reportEvent("shop_opened")
+	MissionManager.requestState()
 end
 
 --[[

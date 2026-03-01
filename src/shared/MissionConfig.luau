@@ -13,19 +13,22 @@
 ]]
 
 local CurrencyConfig = require(script.Parent.CurrencyConfig)
+local ShopConfig = require(script.Parent.ShopConfig)
 
 local MissionConfig = {}
 
-MissionConfig.VERSION = 1
+MissionConfig.VERSION = 2
 MissionConfig.DATASTORE_NAME = "FlappyBirdMissions"
 MissionConfig.AUTOSAVE_INTERVAL = 60
 MissionConfig.COMPLETION_SAVE_DELAY = 2
 MissionConfig.AUTOSAVE_SPREAD_DELAY = 0.05
+MissionConfig.MAX_TRACKED_SCORE = 1000000000
 
 MissionConfig.REMOTES = {
 	GET_STATE = "MissionGetState",
 	REPORT_EVENT = "MissionReportEvent",
 	STATE_UPDATED = "MissionStateUpdated",
+	REDEEM = "MissionRedeem",
 }
 
 --============================================================================
@@ -129,6 +132,8 @@ MissionConfig.READY_BUTTON = {
 --   cooldown  : minimum seconds between accepted events of this type per user
 --   startRun  : marks a run as active
 --   finishRun : marks a run as inactive (ignored if no active run)
+--   requiresRunActive   : event is accepted only while a run is active
+--   requiresRunInactive : event is accepted only while no run is active
 --============================================================================
 
 MissionConfig.EVENTS = {
@@ -188,7 +193,7 @@ MissionConfig.EVENTS = {
 				from = "score",
 				integer = true,
 				clampMin = 0,
-				clampMax = 10000,
+				clampMax = MissionConfig.MAX_TRACKED_SCORE,
 			},
 			{
 				path = "stats.best_score",
@@ -196,7 +201,7 @@ MissionConfig.EVENTS = {
 				from = "score",
 				integer = true,
 				clampMin = 0,
-				clampMax = 10000,
+				clampMax = MissionConfig.MAX_TRACKED_SCORE,
 			},
 			{
 				path = "stats.last_submitted_score",
@@ -204,7 +209,23 @@ MissionConfig.EVENTS = {
 				from = "score",
 				integer = true,
 				clampMin = 0,
-				clampMax = 10000,
+				clampMax = MissionConfig.MAX_TRACKED_SCORE,
+			},
+		},
+	},
+
+	score_progress = {
+		source = "client",
+		cooldown = 0.1,
+		requiresRunActive = true,
+		updates = {
+			{
+				path = "stats.best_score",
+				op = "max",
+				from = "score",
+				integer = true,
+				clampMin = 0,
+				clampMax = MissionConfig.MAX_TRACKED_SCORE,
 			},
 		},
 	},
@@ -293,7 +314,7 @@ MissionConfig.MISSIONS = {
 		condition = { type = "compare", path = "stats.shop_opens", op = ">=", value = 1 },
 		progress = { path = "stats.shop_opens", target = 1 },
 		rewards = {
-			{ type = "shop_item", itemId = "trail_smoke", duplicateBacon = 100 },
+			{ type = "bacon", amount = 100 },
 		},
 	},
 	{
@@ -326,7 +347,7 @@ MissionConfig.MISSIONS = {
 		condition = { type = "compare", path = "stats.best_score", op = ">=", value = 25 },
 		progress = { path = "stats.best_score", target = 25 },
 		rewards = {
-			{ type = "shop_item", itemId = "pipe_classic_green", duplicateBacon = 60 },
+			{ type = "bacon", amount = 60},
 		},
 	},
 	{
@@ -337,7 +358,7 @@ MissionConfig.MISSIONS = {
 		condition = { type = "compare", path = "stats.best_score", op = ">=", value = 50 },
 		progress = { path = "stats.best_score", target = 50 },
 		rewards = {
-			{ type = "shop_item", itemId = "floor_dark_gray", duplicateBacon = 120 },
+			{ type = "bacon", amount = 120 },
 		},
 	},
 	{
@@ -348,7 +369,7 @@ MissionConfig.MISSIONS = {
 		condition = { type = "compare", path = "stats.best_score", op = ">=", value = 100 },
 		progress = { path = "stats.best_score", target = 100 },
 		rewards = {
-			{ type = "shop_item", itemId = "floor_dark_gray", duplicateBacon = 120 },
+			{ type = "bacon", amount = 180 },
 		},
 	},
 	{
@@ -386,6 +407,71 @@ MissionConfig.MISSIONS = {
 	},
 }
 
+MissionConfig.SCORE_THRESHOLD_TRACKERS = {}
+
+local function appendShopUnlockMissions()
+	local seenMissionIds = {}
+	for _, mission in ipairs(MissionConfig.MISSIONS) do
+		seenMissionIds[mission.id] = true
+	end
+
+	local seenTrackerPaths = {}
+
+	for _, lockedItem in ipairs(ShopConfig.getMissionLockedItems()) do
+		local unlock = lockedItem.unlockMission
+		if type(unlock) == "table" then
+			local missionId = tostring(lockedItem.requiredMissionId or unlock.id or "")
+			local progressPath = tostring(unlock.progressPath or "")
+			local scoreTarget = math.max(1, math.floor(tonumber(unlock.scoreTarget) or 0))
+
+			if missionId ~= "" and progressPath ~= "" and scoreTarget > 0 then
+				if not seenMissionIds[missionId] then
+					local mission = {
+						id = missionId,
+						title = tostring(unlock.title or ("Unlock " .. tostring(lockedItem.itemName or lockedItem.itemId))),
+						description = tostring(unlock.description or "Complete the challenge to unlock this shop item."),
+						condition = {
+							type = "compare",
+							path = progressPath,
+							op = ">=",
+							value = scoreTarget,
+						},
+						progress = {
+							path = progressPath,
+							target = scoreTarget,
+						},
+						rewards = {
+							{
+								type = "shop_unlock",
+								itemId = lockedItem.itemId,
+							},
+						},
+					}
+
+					if type(unlock.requiresMissionId) == "string" and unlock.requiresMissionId ~= "" then
+						mission.requires = { unlock.requiresMissionId }
+					end
+
+					table.insert(MissionConfig.MISSIONS, mission)
+					seenMissionIds[missionId] = true
+				end
+
+				local metricField = tostring(unlock.metricField or "")
+				if metricField ~= "" and not seenTrackerPaths[progressPath] then
+					table.insert(MissionConfig.SCORE_THRESHOLD_TRACKERS, {
+						path = progressPath,
+						metricField = metricField,
+						thresholdValue = tonumber(unlock.thresholdValue) or 0,
+					})
+					seenTrackerPaths[progressPath] = true
+				end
+			end
+		end
+	end
+end
+
+appendShopUnlockMissions()
+
 local missionById = {}
 for _, mission in ipairs(MissionConfig.MISSIONS) do
 	missionById[mission.id] = mission
@@ -397,6 +483,10 @@ end
 
 function MissionConfig.getEvent(eventName)
 	return MissionConfig.EVENTS[eventName]
+end
+
+function MissionConfig.getScoreThresholdTrackers()
+	return MissionConfig.SCORE_THRESHOLD_TRACKERS
 end
 
 return MissionConfig

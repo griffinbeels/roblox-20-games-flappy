@@ -2,8 +2,8 @@
 	ReadyUI.luau
 
 	Displays "Press [JumpKey] to Start" during READY state.
-	Also owns the world-space ready buttons (Shop + Missions), both attached
-	to the leaderboard billboard anchor.
+	Also owns the world-space ready buttons (Shop + Missions + Prestige),
+	attached to the leaderboard billboard anchor.
 ]]
 
 local Players = game:GetService("Players")
@@ -13,6 +13,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local JumpInput = require(script.Parent.JumpInput)
 local ShopConfig = require(ReplicatedStorage.Shared.ShopConfig)
 local MissionConfig = require(ReplicatedStorage.Shared.MissionConfig)
+local PrestigeConfig = require(ReplicatedStorage.Shared.PrestigeConfig)
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local ReadyUI = {}
@@ -24,9 +25,17 @@ local messageLabel = nil
 
 local shopBillboardGui = nil
 local missionsBillboardGui = nil
+local prestigeBillboardGui = nil
+local missionsBadgeFrame = nil
+local missionsBadgeLabel = nil
+local missionsBadgeCount = 0
+local prestigeBadgeFrame = nil
+local prestigeBadgeLabel = nil
+local prestigeBadgeCount = 0
 
 local onShopClickCallback = nil
 local onMissionsClickCallback = nil
+local onPrestigeClickCallback = nil
 local readyButtons = {}
 local viewportConnection = nil
 
@@ -256,6 +265,25 @@ local function createReadyButtonBillboard(name, parentPart, btnCfg, onActivated)
 	return billboard
 end
 
+local function setPrestigeButtonVisual(isReady)
+	if not prestigeBillboardGui then return end
+	local background = prestigeBillboardGui:FindFirstChild("Background")
+	local label = background and background:FindFirstChild("Label")
+	if not background or not label then
+		return
+	end
+
+	if isReady then
+		background.BackgroundColor3 = PrestigeConfig.READY_BUTTON.READY_BG_COLOR or PrestigeConfig.READY_BUTTON.BG_COLOR
+		label.Text = PrestigeConfig.READY_BUTTON.READY_LABEL or PrestigeConfig.READY_BUTTON.LABEL
+		label.TextColor3 = PrestigeConfig.READY_BUTTON.READY_LABEL_COLOR or PrestigeConfig.READY_BUTTON.LABEL_COLOR
+	else
+		background.BackgroundColor3 = PrestigeConfig.READY_BUTTON.BG_COLOR
+		label.Text = PrestigeConfig.READY_BUTTON.LABEL
+		label.TextColor3 = PrestigeConfig.READY_BUTTON.LABEL_COLOR
+	end
+end
+
 local function isMouseOverBillboard(billboardGui)
 	if not billboardGui or not billboardGui.Enabled then return false end
 	local adornee = billboardGui.Adornee
@@ -285,6 +313,43 @@ local function isMouseOverBillboard(billboardGui)
 	local mousePos = UserInputService:GetMouseLocation()
 	return mousePos.X >= left and mousePos.X <= left + screenW
 		and mousePos.Y >= top and mousePos.Y <= top + screenH
+end
+
+local function formatBadgeCount(count)
+	if count > 99 then
+		return "99+"
+	end
+	return tostring(count)
+end
+
+local function applyMissionsBadge()
+	if not missionsBadgeFrame or not missionsBadgeLabel then
+		return
+	end
+
+	local count = math.max(0, math.floor(tonumber(missionsBadgeCount) or 0))
+	if count <= 0 then
+		missionsBadgeFrame.Visible = false
+		return
+	end
+
+	missionsBadgeFrame.Visible = true
+	missionsBadgeLabel.Text = formatBadgeCount(count)
+end
+
+local function applyPrestigeBadge()
+	if not prestigeBadgeFrame or not prestigeBadgeLabel then
+		return
+	end
+
+	local count = math.max(0, math.floor(tonumber(prestigeBadgeCount) or 0))
+	if count <= 0 then
+		prestigeBadgeFrame.Visible = false
+		return
+	end
+
+	prestigeBadgeFrame.Visible = true
+	prestigeBadgeLabel.Text = formatBadgeCount(count)
 end
 
 function ReadyUI.init()
@@ -339,6 +404,105 @@ function ReadyUI.init()
 			end
 		)
 		registerReadyButton(missionsBillboardGui, MissionConfig.READY_BUTTON)
+
+		local missionsBg = missionsBillboardGui:FindFirstChild("Background")
+		if missionsBg and missionsBg:IsA("Frame") then
+			missionsBadgeFrame = Instance.new("Frame")
+			missionsBadgeFrame.Name = "RedeemBadge"
+			missionsBadgeFrame.AnchorPoint = Vector2.new(1, 0)
+			missionsBadgeFrame.Position = UDim2.new(1, -3, 0, 3)
+			missionsBadgeFrame.Size = UDim2.new(0.38, 0, 0.24, 0)
+			missionsBadgeFrame.BackgroundColor3 = Color3.fromRGB(210, 45, 45)
+			missionsBadgeFrame.BorderSizePixel = 0
+			missionsBadgeFrame.Visible = false
+			missionsBadgeFrame.ZIndex = 5
+			missionsBadgeFrame.Parent = missionsBg
+
+			local badgeCorner = Instance.new("UICorner")
+			badgeCorner.CornerRadius = UDim.new(0.45, 0)
+			badgeCorner.Parent = missionsBadgeFrame
+
+			local badgeStroke = Instance.new("UIStroke")
+			badgeStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			badgeStroke.Color = Color3.fromRGB(255, 245, 245)
+			badgeStroke.Thickness = 1
+			badgeStroke.Transparency = 0.25
+			badgeStroke.Parent = missionsBadgeFrame
+
+			missionsBadgeLabel = Instance.new("TextLabel")
+			missionsBadgeLabel.Name = "Count"
+			missionsBadgeLabel.Size = UDim2.new(1, 0, 1, 0)
+			missionsBadgeLabel.BackgroundTransparency = 1
+			missionsBadgeLabel.Text = "0"
+			missionsBadgeLabel.TextColor3 = Color3.new(1, 1, 1)
+			missionsBadgeLabel.TextScaled = true
+			missionsBadgeLabel.Font = Enum.Font.GothamBlack
+			missionsBadgeLabel.ZIndex = 6
+			missionsBadgeLabel.Parent = missionsBadgeFrame
+
+			local badgeTextConstraint = Instance.new("UITextSizeConstraint")
+			badgeTextConstraint.MinTextSize = 8
+			badgeTextConstraint.MaxTextSize = 24
+			badgeTextConstraint.Parent = missionsBadgeLabel
+
+			applyMissionsBadge()
+		end
+
+		prestigeBillboardGui = createReadyButtonBillboard(
+			"PrestigeButtonBillboardGui",
+			leaderboardPart,
+			PrestigeConfig.READY_BUTTON,
+			function()
+				if onPrestigeClickCallback then
+					onPrestigeClickCallback()
+				end
+			end
+		)
+		registerReadyButton(prestigeBillboardGui, PrestigeConfig.READY_BUTTON)
+
+		local prestigeBg = prestigeBillboardGui:FindFirstChild("Background")
+		if prestigeBg and prestigeBg:IsA("Frame") then
+			prestigeBadgeFrame = Instance.new("Frame")
+			prestigeBadgeFrame.Name = "RedeemBadge"
+			prestigeBadgeFrame.AnchorPoint = Vector2.new(1, 0)
+			prestigeBadgeFrame.Position = UDim2.new(1, -3, 0, 3)
+			prestigeBadgeFrame.Size = UDim2.new(0.38, 0, 0.24, 0)
+			prestigeBadgeFrame.BackgroundColor3 = Color3.fromRGB(210, 45, 45)
+			prestigeBadgeFrame.BorderSizePixel = 0
+			prestigeBadgeFrame.Visible = false
+			prestigeBadgeFrame.ZIndex = 5
+			prestigeBadgeFrame.Parent = prestigeBg
+
+			local badgeCorner = Instance.new("UICorner")
+			badgeCorner.CornerRadius = UDim.new(0.45, 0)
+			badgeCorner.Parent = prestigeBadgeFrame
+
+			local badgeStroke = Instance.new("UIStroke")
+			badgeStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			badgeStroke.Color = Color3.fromRGB(255, 245, 245)
+			badgeStroke.Thickness = 1
+			badgeStroke.Transparency = 0.25
+			badgeStroke.Parent = prestigeBadgeFrame
+
+			prestigeBadgeLabel = Instance.new("TextLabel")
+			prestigeBadgeLabel.Name = "Count"
+			prestigeBadgeLabel.Size = UDim2.new(1, 0, 1, 0)
+			prestigeBadgeLabel.BackgroundTransparency = 1
+			prestigeBadgeLabel.Text = "0"
+			prestigeBadgeLabel.TextColor3 = Color3.new(1, 1, 1)
+			prestigeBadgeLabel.TextScaled = true
+			prestigeBadgeLabel.Font = Enum.Font.GothamBlack
+			prestigeBadgeLabel.ZIndex = 6
+			prestigeBadgeLabel.Parent = prestigeBadgeFrame
+
+			local badgeTextConstraint = Instance.new("UITextSizeConstraint")
+			badgeTextConstraint.MinTextSize = 8
+			badgeTextConstraint.MaxTextSize = 24
+			badgeTextConstraint.Parent = prestigeBadgeLabel
+
+			applyPrestigeBadge()
+		end
+		setPrestigeButtonVisual(false)
 	else
 		warn("[ReadyUI] Leaderboard Part not found - ready buttons disabled.")
 	end
@@ -360,6 +524,10 @@ end
 
 function ReadyUI.setOnMissionsClick(callback)
 	onMissionsClickCallback = callback
+end
+
+function ReadyUI.setOnPrestigeClick(callback)
+	onPrestigeClickCallback = callback
 end
 
 function ReadyUI.show()
@@ -410,9 +578,42 @@ function ReadyUI.isMissionsButtonMouseOver()
 	return isMouseOverBillboard(missionsBillboardGui)
 end
 
+function ReadyUI.setMissionsBadgeCount(count)
+	missionsBadgeCount = math.max(0, math.floor(tonumber(count) or 0))
+	applyMissionsBadge()
+end
+
+function ReadyUI.setPrestigeBadgeCount(count)
+	prestigeBadgeCount = math.max(0, math.floor(tonumber(count) or 0))
+	applyPrestigeBadge()
+end
+
+function ReadyUI.showPrestigeButton()
+	if prestigeBillboardGui then
+		prestigeBillboardGui.Enabled = true
+		layoutReadyButtons()
+	end
+end
+
+function ReadyUI.hidePrestigeButton()
+	if prestigeBillboardGui then
+		prestigeBillboardGui.Enabled = false
+		layoutReadyButtons()
+	end
+end
+
+function ReadyUI.isPrestigeButtonMouseOver()
+	return isMouseOverBillboard(prestigeBillboardGui)
+end
+
+function ReadyUI.setPrestigeReadyIndicator(isReady)
+	setPrestigeButtonVisual(isReady == true)
+end
+
 function ReadyUI.destroy()
 	onShopClickCallback = nil
 	onMissionsClickCallback = nil
+	onPrestigeClickCallback = nil
 	readyButtons = {}
 	if viewportConnection then
 		viewportConnection:Disconnect()
@@ -433,6 +634,17 @@ function ReadyUI.destroy()
 		missionsBillboardGui:Destroy()
 		missionsBillboardGui = nil
 	end
+	missionsBadgeFrame = nil
+	missionsBadgeLabel = nil
+	missionsBadgeCount = 0
+
+	if prestigeBillboardGui then
+		prestigeBillboardGui:Destroy()
+		prestigeBillboardGui = nil
+	end
+	prestigeBadgeFrame = nil
+	prestigeBadgeLabel = nil
+	prestigeBadgeCount = 0
 end
 
 return ReadyUI

@@ -15,14 +15,17 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local ShopConfig = require(ReplicatedStorage.Shared.ShopConfig)
 local TrailConfig = require(ReplicatedStorage.Shared.TrailConfig)
+local PoofConfig = require(ReplicatedStorage.Shared.PoofConfig)
 local PipeConfig = require(ReplicatedStorage.Shared.PipeConfig)
 local ParallaxConfig = require(ReplicatedStorage.Shared.ParallaxConfig)
+local RuntimeTuning = require(ReplicatedStorage.Shared.RuntimeTuning)
 
 local ShopManager = {}
 
 -- Cached state
 local owned = {}      -- { [itemId] = true }
 local equipped = {}   -- { [categoryId] = itemId }
+local completedMissionIds = {} -- { [missionId] = true }
 local isReady = false
 local isDirty = false  -- true if any equip changed since last applyAllEquipped()
 
@@ -54,6 +57,44 @@ local function fireReady()
 	readyCallbacks = {}
 end
 
+local function missionRequirementMet(item)
+	local missionId = item and item.requiredMissionId
+	if type(missionId) ~= "string" or missionId == "" then
+		return true
+	end
+	return completedMissionIds[missionId] == true
+end
+
+local function sanitizeEquippedForCurrentCatalog()
+	for _, cat in ipairs(ShopConfig.CATEGORIES) do
+		local equippedItemId = equipped[cat.id]
+		local equippedItem = equippedItemId and ShopConfig.getItem(equippedItemId) or nil
+		if not equippedItem then
+			local def = ShopConfig.getDefault(cat.id)
+			if def then
+				equipped[cat.id] = def.id
+				owned[def.id] = true
+			else
+				equipped[cat.id] = nil
+			end
+		end
+	end
+end
+
+local function applyServerShopData(data)
+	if type(data) ~= "table" then
+		return false
+	end
+
+	owned = data.owned or {}
+	equipped = data.equipped or {}
+	sanitizeEquippedForCurrentCatalog()
+
+	isDirty = true
+	fireChanged()
+	return true
+end
+
 --============================================================================
 -- APPLIERS — push equipped items into runtime configs
 --============================================================================
@@ -61,6 +102,13 @@ end
 local appliers = {
 	trails = function(item)
 		TrailConfig.ACTIVE_STYLE = item.configKey
+	end,
+	poofs = function(item)
+		if item.configKey and PoofConfig.STYLES[item.configKey] then
+			PoofConfig.ACTIVE_STYLE = item.configKey
+		else
+			PoofConfig.ACTIVE_STYLE = PoofConfig.DEFAULT_STYLE
+		end
 	end,
 	pipes = function(item)
 		PipeConfig.setActiveStyles(item.configKey)
@@ -127,8 +175,7 @@ function ShopManager.init()
 		end)
 
 		if ok and data then
-			owned = data.owned or {}
-			equipped = data.equipped or {}
+			applyServerShopData(data)
 		else
 			warn("[ShopManager] Failed to fetch shop data — using defaults.")
 			setDefaults()
@@ -137,7 +184,9 @@ function ShopManager.init()
 		isReady = true
 		isDirty = true -- apply on first game start
 		fireReady()
-		fireChanged()
+		if not (ok and data) then
+			fireChanged()
+		end
 	end)
 end
 
@@ -146,6 +195,54 @@ end
 ]]
 function ShopManager.isReady()
 	return isReady
+end
+
+--[[
+	Updates local mission completion cache used for item locking.
+	@param missionState table? - MissionManager state payload
+]]
+function ShopManager.setMissionState(missionState)
+	local nextCompleted = {}
+
+	if type(missionState) == "table" and type(missionState.missions) == "table" then
+		for _, mission in ipairs(missionState.missions) do
+			local isRedeemed = false
+			if type(mission) == "table" then
+				if mission.redeemed ~= nil then
+					isRedeemed = mission.redeemed == true
+				else
+					-- Backward-compatible fallback for older mission payloads.
+					isRedeemed = mission.completed == true
+				end
+			end
+
+			if type(mission) == "table" and isRedeemed and type(mission.id) == "string" then
+				nextCompleted[mission.id] = true
+			end
+		end
+	end
+
+	local changed = false
+	for missionId in pairs(nextCompleted) do
+		if not completedMissionIds[missionId] then
+			changed = true
+			break
+		end
+	end
+	if not changed then
+		for missionId in pairs(completedMissionIds) do
+			if not nextCompleted[missionId] then
+				changed = true
+				break
+			end
+		end
+	end
+	if not changed then
+		return
+	end
+
+	completedMissionIds = nextCompleted
+	fireChanged()
 end
 
 --[[
@@ -165,7 +262,8 @@ function ShopManager.isEquipped(itemId)
 end
 
 --[[
-	Returns the button state for an item: "buy", "equip", "equipped", or "comingSoon".
+	Returns the button state for an item:
+	"buy", "locked", "equip", "equipped", or "comingSoon".
 ]]
 function ShopManager.getItemState(itemId)
 	local item = ShopConfig.getItem(itemId)
@@ -174,6 +272,9 @@ function ShopManager.getItemState(itemId)
 	end
 
 	if not ShopManager.isOwned(itemId) then
+		if item and not missionRequirementMet(item) then
+			return "locked"
+		end
 		return "buy"
 	end
 	if ShopManager.isEquipped(itemId) then
@@ -203,6 +304,9 @@ function ShopManager.purchase(itemId, CurrencyManager)
 	local item = ShopConfig.getItem(itemId)
 	if item and item.comingSoon then
 		return false, "Coming soon"
+	end
+	if item and not missionRequirementMet(item) and not ShopManager.isOwned(itemId) then
+		return false, "Complete mission first"
 	end
 
 	local ok, result = pcall(function()
@@ -292,16 +396,28 @@ end
 ]]
 function ShopManager.applyServerSnapshot(snapshot)
 	if type(snapshot) ~= "table" then return end
+	applyServerShopData(snapshot)
+end
 
-	if type(snapshot.owned) == "table" then
-		owned = snapshot.owned
-	end
-	if type(snapshot.equipped) == "table" then
-		equipped = snapshot.equipped
+--[[
+	Refreshes shop state from the server and updates local cache.
+	Useful for debug resets and other out-of-band server changes.
+]]
+function ShopManager.requestData()
+	if not getDataRemote then
+		return false, "Shop not ready"
 	end
 
-	isDirty = true
-	fireChanged()
+	local ok, data = pcall(function()
+		return getDataRemote:InvokeServer()
+	end)
+	if not ok then
+		return false, "Network error"
+	end
+	if not applyServerShopData(data) then
+		return false, "Invalid response"
+	end
+	return true
 end
 
 --[[
@@ -326,6 +442,8 @@ end
 	Called by GameController at the start of each round and after shop close.
 ]]
 function ShopManager.applyAllEquipped()
+	local activeTuning = RuntimeTuning.getDefaultTuning()
+
 	for _, cat in ipairs(ShopConfig.CATEGORIES) do
 		local itemId = equipped[cat.id]
 		if itemId then
@@ -334,7 +452,23 @@ function ShopManager.applyAllEquipped()
 			if item and applier then
 				applier(item)
 			end
+
+			if item then
+				if item.speedCapMultiplier ~= nil then
+					activeTuning.speedCapMultiplier = tonumber(item.speedCapMultiplier) or activeTuning.speedCapMultiplier
+				end
+				if item.gravity ~= nil then
+					activeTuning.gravity = tonumber(item.gravity) or activeTuning.gravity
+				end
+				if item.jumpPowerMultiplier ~= nil then
+					activeTuning.jumpPowerMultiplier = tonumber(item.jumpPowerMultiplier) or activeTuning.jumpPowerMultiplier
+				end
+			end
 		end
+	end
+
+	if ShopConfig.SHOP_TUNING_ENABLED then
+		RuntimeTuning.setActiveFixedTuning(activeTuning)
 	end
 	isDirty = false
 end

@@ -129,4 +129,16 @@ function ScoreManager.requestPersonalBest()
 	end
 end
 
+--[[
+	Debug helper: force overwrite local personal best cache.
+	Useful when the server intentionally resets progression during a playtest.
+]]
+function ScoreManager.debugForcePersonalBest(value)
+	local numeric = tonumber(value)
+	if numeric == nil then
+		return
+	end
+	personalBest = math.max(0, math.floor(numeric))
+end
+
 return ScoreManager

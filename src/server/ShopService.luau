@@ -19,6 +19,7 @@ local CurrencyService = require(script.Parent.CurrencyService)
 
 local ShopService = {}
 local missionReporter = nil
+local missionService = nil
 
 -- DataStore handle
 local shopDataStore = nil
@@ -44,6 +45,27 @@ local function reportMissionEvent(player, eventName, payload)
 	if not ok then
 		warn("[ShopService] Mission reporter failed:", err)
 	end
+end
+
+local function isMissionRequirementMet(userId, missionId)
+	if type(missionId) ~= "string" or missionId == "" then
+		return true, nil
+	end
+
+	if not missionService or type(missionService.isMissionCompleted) ~= "function" then
+		return false, "Mission system unavailable"
+	end
+
+	local ok, isCompleted = pcall(missionService.isMissionCompleted, userId, missionId)
+	if not ok then
+		return false, "Mission check failed"
+	end
+
+	if isCompleted == true then
+		return true, nil
+	end
+
+	return false, "Complete mission first"
 end
 
 --[[
@@ -112,8 +134,11 @@ local function readShopData(userId)
 		end
 		if stored.equipped then
 			for catId, itemId in pairs(stored.equipped) do
-				-- Only use stored equipped if the item is actually owned
-				if data.owned[itemId] then
+				-- Only use stored equipped if the item exists in the active catalog,
+				-- matches the category, and is actually owned.
+				local catalogItem = ShopConfig.getItem(itemId)
+				local catalogCatId = ShopConfig.getCategoryForItem(itemId)
+				if catalogItem and catalogCatId == catId and data.owned[itemId] then
 					data.equipped[catId] = itemId
 				end
 			end
@@ -168,6 +193,17 @@ function ShopService.setMissionReporter(callback)
 end
 
 --[[
+	Injects service dependencies.
+	@param deps table? { missionService = module }
+]]
+function ShopService.setDependencies(deps)
+	if type(deps) ~= "table" then
+		return
+	end
+	missionService = deps.missionService or missionService
+end
+
+--[[
 	Grants a shop item directly (used by mission rewards).
 	@param userId number
 	@param itemId string
@@ -204,6 +240,45 @@ function ShopService.grantItem(userId, itemId, options)
 
 	saveShopData(userId)
 	return true, nil, data
+end
+
+--[[
+	Debug-only helper: fully resets a player's shop ownership/equips to defaults.
+	@param playerOrUserId Player|number
+	@return boolean success, string? err, table? snapshot
+]]
+function ShopService.debugResetPlayer(playerOrUserId)
+	local userId = nil
+	if typeof(playerOrUserId) == "Instance" and playerOrUserId:IsA("Player") then
+		userId = playerOrUserId.UserId
+	else
+		userId = tonumber(playerOrUserId)
+	end
+
+	if not userId then
+		return false, "Invalid player/userId"
+	end
+
+	local resetData = {
+		owned = getDefaultItemIds(),
+		equipped = getDefaultEquipped(),
+	}
+	cachedData[userId] = resetData
+
+	if dataStoreAvailable and shopDataStore then
+		local ok, err = pcall(function()
+			shopDataStore:RemoveAsync("user_" .. userId)
+		end)
+		if not ok then
+			warn("[ShopService] Failed to reset shop data for user " .. userId .. ": " .. tostring(err))
+			return false, tostring(err)
+		end
+	end
+
+	return true, nil, {
+		owned = resetData.owned,
+		equipped = resetData.equipped,
+	}
 end
 
 --[[
@@ -254,6 +329,16 @@ function ShopService.init()
 		end
 
 		local data = readShopData(player.UserId)
+
+		local missionId = item.requiredMissionId
+		local missionOk, missionReason = isMissionRequirementMet(player.UserId, missionId)
+		if not missionOk and not data.owned[itemId] then
+			return {
+				success = false,
+				reason = missionReason or "Complete mission first",
+				requiredMissionId = missionId,
+			}
+		end
 
 		-- Already owned?
 		if data.owned[itemId] then

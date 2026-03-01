@@ -23,6 +23,7 @@ local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 
 local LeaderboardService = {}
 local missionReporter = nil
+local getPersonalBestRemoteRef = nil
 
 -- DataStore handles
 local scoresDataStore = nil
@@ -289,6 +290,60 @@ function LeaderboardService.setMissionReporter(callback)
 end
 
 --[[
+	Debug-only helper: resets a player's personal best and removes them from leaderboard caches/stores.
+	@param playerOrUserId Player|number
+	@return boolean success, string? err
+]]
+function LeaderboardService.debugResetPlayer(playerOrUserId)
+	local userId = nil
+	local player = nil
+	if typeof(playerOrUserId) == "Instance" and playerOrUserId:IsA("Player") then
+		player = playerOrUserId
+		userId = player.UserId
+	else
+		userId = tonumber(playerOrUserId)
+		if userId then
+			player = Players:GetPlayerByUserId(userId)
+		end
+	end
+
+	if not userId then
+		return false, "Invalid player/userId"
+	end
+
+	if dataStoreAvailable and scoresDataStore then
+		local ok, err = pcall(function()
+			scoresDataStore:RemoveAsync("user_" .. userId)
+		end)
+		if not ok then
+			warn("[LeaderboardService] Failed to reset personal best for user " .. userId .. ": " .. tostring(err))
+			return false, tostring(err)
+		end
+	end
+
+	if rankedDataStore then
+		pcall(function()
+			rankedDataStore:RemoveAsync("user_" .. userId)
+		end)
+	end
+
+	cachedBests[userId] = 0
+	for i = #leaderboardCache, 1, -1 do
+		if leaderboardCache[i].userId == userId then
+			table.remove(leaderboardCache, i)
+			break
+		end
+	end
+	rebuildRankIndex()
+
+	if player and getPersonalBestRemoteRef then
+		getPersonalBestRemoteRef:FireClient(player, 0)
+	end
+
+	return true
+end
+
+--[[
 	Initializes the LeaderboardService.
 	Creates RemoteEvents/RemoteFunctions and wires up server handlers.
 	Starts periodic leaderboard cache refresh.
@@ -309,6 +364,7 @@ function LeaderboardService.init()
 		getPersonalBestRemote.Name = "GetPersonalBest"
 		getPersonalBestRemote.Parent = remoteFolder
 	end
+	getPersonalBestRemoteRef = getPersonalBestRemote
 
 	getPersonalBestRemote.OnServerEvent:Connect(function(player)
 		local best = readPlayerBest(player.UserId)

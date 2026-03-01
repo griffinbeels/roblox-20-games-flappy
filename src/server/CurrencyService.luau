@@ -39,6 +39,7 @@ end
 local cachedBalances = {} -- userId -> lifetime balance including pending deltas
 local pendingDeltas = {}  -- userId -> earned amount not flushed to DataStore yet
 local flushScheduled = {} -- userId -> true while debounce timer is active
+local getBalanceRemoteRef = nil
 
 local function reportMissionEvent(player, eventName, payload)
 	if not missionReporter then return end
@@ -233,6 +234,49 @@ function CurrencyService.setMissionReporter(callback)
 	missionReporter = callback
 end
 
+--[[
+	Debug-only helper: fully resets a player's stored and cached currency balance.
+	@param playerOrUserId Player|number
+	@return boolean success, string? err
+]]
+function CurrencyService.debugResetPlayer(playerOrUserId)
+	local userId = nil
+	local player = nil
+	if typeof(playerOrUserId) == "Instance" and playerOrUserId:IsA("Player") then
+		player = playerOrUserId
+		userId = player.UserId
+	else
+		userId = tonumber(playerOrUserId)
+		if userId then
+			player = Players:GetPlayerByUserId(userId)
+		end
+	end
+
+	if not userId then
+		return false, "Invalid player/userId"
+	end
+
+	flushScheduled[userId] = nil
+	pendingDeltas[userId] = 0
+	cachedBalances[userId] = 0
+
+	if dataStoreAvailable and currencyDataStore then
+		local ok, err = pcall(function()
+			currencyDataStore:RemoveAsync(keyForUser(userId))
+		end)
+		if not ok then
+			warn("[CurrencyService] Failed to reset currency for user " .. userId .. ": " .. tostring(err))
+			return false, tostring(err)
+		end
+	end
+
+	if player and getBalanceRemoteRef then
+		getBalanceRemoteRef:FireClient(player, 0)
+	end
+
+	return true
+end
+
 --============================================================================
 -- INIT
 --============================================================================
@@ -257,6 +301,7 @@ function CurrencyService.init()
 		getBalanceRemote.Name = "GetCurrencyBalance"
 		getBalanceRemote.Parent = remoteFolder
 	end
+	getBalanceRemoteRef = getBalanceRemote
 
 	getBalanceRemote.OnServerEvent:Connect(function(player)
 		local balance = readBalance(player.UserId)

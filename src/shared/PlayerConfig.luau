@@ -27,7 +27,7 @@
 local PlayerConfig = {}
 
 -- GRAVITY: How fast the player falls
-PlayerConfig.GRAVITY = 250
+PlayerConfig.GRAVITY = 150
 
 -- Starting position in the game area
 PlayerConfig.START_POSITION = Vector3.new(0, 15, 0)

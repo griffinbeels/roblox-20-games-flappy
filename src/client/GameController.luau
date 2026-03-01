@@ -17,6 +17,8 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local CameraConfig = require(ReplicatedStorage.Shared.CameraConfig)
+local RuntimeTuning = require(ReplicatedStorage.Shared.RuntimeTuning)
+local PrestigeConfig = require(ReplicatedStorage.Shared.PrestigeConfig)
 local JumpInput = require(script.Parent.JumpInput)
 
 -- Hub/Lobby modules - loaded immediately (don't affect player/camera)
@@ -38,6 +40,8 @@ local ShopManager = require(script.Parent.ShopManager)
 local ShopUI = require(script.Parent.ShopUI)
 local MissionManager = require(script.Parent.MissionManager)
 local MissionsUI = require(script.Parent.MissionsUI)
+local PrestigeManager = require(script.Parent.PrestigeManager)
+local PrestigeUI = require(script.Parent.PrestigeUI)
 
 -- Game modules - lazy loaded to avoid affecting hub
 local PlayerController = nil
@@ -58,11 +62,25 @@ local readyHoverConnection = nil
 local respawnConnection = nil
 local characterRemovingConnection = nil
 local humanoidDiedConnection = nil
+local debugProgressResetConnection = nil
+local speedDebugLogToggleConnection = nil
 local requestRespawnRemote = nil -- RemoteEvent to ask server for a new character
 local isGameInitialized = false
 local currentState = nil -- tracks actual state to prevent reentrant transitions
 local isRespawning = false -- true while a manual respawn is in progress
 local isGameOverDeath = false -- true when the game killed the humanoid (not a manual reset)
+local PRESTIGE_ENABLED = PrestigeConfig.ENABLED == true
+local desiredSpeedDebugLogEnabled = false
+
+local function buildRuntimeMissionPayload(score)
+	local tuning = RuntimeTuning.getActiveTuning()
+	return {
+		score = score,
+		speedCapMultiplier = tuning.speedCapMultiplier,
+		gravity = tuning.gravity,
+		jumpPowerMultiplier = tuning.jumpPowerMultiplier,
+	}
+end
 
 --[[
 	Hides ALL game UI screens.
@@ -74,9 +92,80 @@ local function hideAllGameUI()
 	ReadyUI.hide()
 	ReadyUI.hideShopButton()
 	ReadyUI.hideMissionsButton()
+	ReadyUI.hidePrestigeButton()
 	ScoreUI.hide()
 	ShopUI.hide()
 	MissionsUI.hide()
+	PrestigeUI.hide()
+end
+
+local function handleDebugProgressReset(payload)
+	local mode = if type(payload) == "table" then tostring(payload.mode or "all") else tostring(payload or "all")
+	local errors = if type(payload) == "table" and type(payload.errors) == "table" then payload.errors else {}
+
+	CurrencyManager.resetPending()
+	CurrencyManager.setLifetimeBalance(0)
+	CurrencyManager.requestBalance()
+
+	ScoreManager.reset()
+	if ScoreManager.debugForcePersonalBest then
+		ScoreManager.debugForcePersonalBest(0)
+	end
+	ScoreManager.requestPersonalBest()
+
+	if mode == "all" and ShopManager.requestData then
+		local ok, reason = ShopManager.requestData()
+		if not ok then
+			warn("[DebugReset] Failed to refresh shop state: " .. tostring(reason))
+		end
+	end
+
+	MissionManager.requestState()
+	if PRESTIGE_ENABLED then
+		PrestigeManager.requestState()
+	end
+
+	if currentState ~= "playing" and ShopManager.needsRefresh and ShopManager.needsRefresh() then
+		ShopManager.applyAllEquipped()
+	end
+
+	if #errors > 0 then
+		warn("[DebugReset] Reset completed with issues: " .. table.concat(errors, " | "))
+	else
+		warn("[DebugReset] Reset completed (" .. mode .. ").")
+	end
+end
+
+local function handleSpeedDebugLogToggle(payload)
+	local nextEnabled = nil
+
+	if type(payload) == "table" then
+		local action = string.lower(tostring(payload.action or "toggle"))
+		if action == "set" then
+			nextEnabled = (payload.enabled == true)
+		end
+	elseif type(payload) == "boolean" then
+		nextEnabled = payload
+	end
+
+	if nextEnabled == nil then
+		if SpeedManager and SpeedManager.toggleDebugSpeedLog then
+			nextEnabled = SpeedManager.toggleDebugSpeedLog()
+		else
+			nextEnabled = not desiredSpeedDebugLogEnabled
+		end
+	else
+		if SpeedManager and SpeedManager.setDebugSpeedLogEnabled then
+			nextEnabled = SpeedManager.setDebugSpeedLogEnabled(nextEnabled)
+		end
+	end
+
+	desiredSpeedDebugLogEnabled = (nextEnabled == true)
+
+	-- If the game systems are not initialized yet, acknowledge the pending state.
+	if not SpeedManager then
+		warn(string.format("[SpeedDebug] Console speed log will be %s when SpeedManager initializes.", desiredSpeedDebugLogEnabled and "ENABLED" or "DISABLED"))
+	end
 end
 
 --[[
@@ -125,6 +214,9 @@ end
 local function enterRespawnLockdown()
 	if currentState == "playing" then
 		MissionManager.reportEvent("run_abandoned")
+		if PRESTIGE_ENABLED then
+			PrestigeManager.reportRunAbandoned()
+		end
 	end
 
 	currentState = nil
@@ -324,6 +416,14 @@ function GameController.init()
 	local remoteFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
 	if remoteFolder then
 		requestRespawnRemote = remoteFolder:FindFirstChild("RequestRespawn")
+		local debugProgressResetRemote = remoteFolder:WaitForChild("DebugProgressReset", 10)
+		if debugProgressResetRemote and not debugProgressResetConnection then
+			debugProgressResetConnection = debugProgressResetRemote.OnClientEvent:Connect(handleDebugProgressReset)
+		end
+		local speedDebugLogToggleRemote = remoteFolder:WaitForChild("ToggleSpeedDebugLog", 10)
+		if speedDebugLogToggleRemote and not speedDebugLogToggleConnection then
+			speedDebugLogToggleConnection = speedDebugLogToggleRemote.OnClientEvent:Connect(handleSpeedDebugLogToggle)
+		end
 	end
 
 	-- Clean up any leftover game objects first
@@ -336,6 +436,9 @@ function GameController.init()
 	CurrencyManager.init()
 	ShopManager.init()
 	MissionManager.init()
+	if PRESTIGE_ENABLED then
+		PrestigeManager.init()
+	end
 
 	-- Initialize UI systems (but don't show them yet)
 	ScoreUI.init()
@@ -344,6 +447,20 @@ function GameController.init()
 	ReadyUI.init()
 	ShopUI.init()
 	MissionsUI.init()
+	if PRESTIGE_ENABLED then
+		PrestigeUI.init()
+	end
+
+	ReadyUI.setMissionsBadgeCount(MissionManager.getNonPrestigeRedeemableCount())
+	if PRESTIGE_ENABLED then
+		ReadyUI.setPrestigeBadgeCount(MissionManager.getPrestigeRedeemableCount())
+	end
+	MissionManager.onStateChanged(function(state)
+		ReadyUI.setMissionsBadgeCount(MissionManager.getNonPrestigeRedeemableCount(state))
+		if PRESTIGE_ENABLED then
+			ReadyUI.setPrestigeBadgeCount(MissionManager.getPrestigeRedeemableCount(state))
+		end
+	end)
 
 	-- Initialize CurrencyUI (shown during READY state only, above leaderboard)
 	CurrencyUI.init()
@@ -424,12 +541,18 @@ function GameController.initGameSystems()
 		return LeaderboardUI.isMouseOver()
 			or ReadyUI.isShopButtonMouseOver()
 			or ReadyUI.isMissionsButtonMouseOver()
+			or ReadyUI.isPrestigeButtonMouseOver()
 			or ShopUI.isOpen()
 			or MissionsUI.isOpen()
+			or PrestigeUI.isOpen()
 	end)
 
 	-- Initialize SpeedManager
 	SpeedManager.reset()
+	local currentSpeedDebugState = if SpeedManager.isDebugSpeedLogEnabled then SpeedManager.isDebugSpeedLogEnabled() else false
+	if SpeedManager.setDebugSpeedLogEnabled and currentSpeedDebugState ~= desiredSpeedDebugLogEnabled then
+		SpeedManager.setDebugSpeedLogEnabled(desiredSpeedDebugLogEnabled)
+	end
 	PlayerController.setSpeedManager(SpeedManager)
 	
 	-- Initialize CameraController (this will take over camera)
@@ -486,12 +609,16 @@ function GameController.initGameSystems()
 	BaconCollectible.setOnAnimationComplete(function()
 		if currentState ~= "playing" then return end
 		ScoreManager.increment()
+		MissionManager.reportEvent("score_progress", buildRuntimeMissionPayload(ScoreManager.getScore()))
 	end)
 
 	-- Wire shop button on ready screen → open shop modal
 	ReadyUI.setOnShopClick(function()
 		if MissionsUI.isOpen() then
 			MissionsUI.hide()
+		end
+		if PrestigeUI.isOpen() then
+			PrestigeUI.hide()
 		end
 		ShopUI.show()
 	end)
@@ -501,8 +628,51 @@ function GameController.initGameSystems()
 		if ShopUI.isOpen() then
 			ShopUI.hide()
 		end
+		if PrestigeUI.isOpen() then
+			PrestigeUI.hide()
+		end
 		MissionsUI.show()
 	end)
+
+	MissionsUI.setMissionActionRouter(function(mission)
+		if PRESTIGE_ENABLED ~= true or type(mission) ~= "table" or mission.canRedeem ~= true then
+			return nil
+		end
+
+		for _, reward in ipairs(mission.rewards or {}) do
+			if type(reward) == "table" and reward.type == "prestige_level" then
+				return {
+					kind = "route",
+					routeId = "prestige_ui",
+				}
+			end
+		end
+
+		return nil
+	end)
+
+	MissionsUI.setOnRouteRequest(function(routeId, _context)
+		if routeId == "prestige_ui" and PRESTIGE_ENABLED == true then
+			if ShopUI.isOpen() then
+				ShopUI.hide()
+			end
+			PrestigeUI.show()
+			return
+		end
+	end)
+
+	-- Wire prestige button on ready screen -> open prestige modal
+	if PRESTIGE_ENABLED then
+		ReadyUI.setOnPrestigeClick(function()
+			if ShopUI.isOpen() then
+				ShopUI.hide()
+			end
+			if MissionsUI.isOpen() then
+				MissionsUI.hide()
+			end
+			PrestigeUI.show()
+		end)
+	end
 
 	local function applyShopRefreshIfNeeded()
 		if currentState ~= "ready" then return end
@@ -527,15 +697,36 @@ function GameController.initGameSystems()
 	end
 
 	-- Wire shop close → apply equipped items + refresh game systems if dirty
+	local function refreshReadyPipesForPrestigeTuning()
+		if currentState ~= "ready" then return end
+		if not PipeManager then return end
+
+		if BaconCollectible then BaconCollectible.clear() end
+		PipeManager.clear()
+		PipeManager.preSpawnPipes()
+		if BaconCollectible then BaconCollectible.start() end
+	end
+
 	ShopUI.setOnClose(function()
 		applyShopRefreshIfNeeded()
 	end)
 
 	-- Ensure saved equipped loadout is applied as soon as initial shop data arrives.
 	ShopManager.onReady(function()
-		if ShopUI.isOpen() or MissionsUI.isOpen() then return end
+		if ShopUI.isOpen() or MissionsUI.isOpen() or PrestigeUI.isOpen() then return end
 		applyShopRefreshIfNeeded()
 	end)
+
+	if PRESTIGE_ENABLED then
+		PrestigeManager.onStateChanged(function(state, context)
+			local isReadyToPrestige = state and state.nextLevel and state.nextLevel.unlocked == true
+			ReadyUI.setPrestigeReadyIndicator(isReadyToPrestige)
+
+			if type(context) == "table" and (context.type == "tuning_applied" or context.type == "prestige_success") then
+				refreshReadyPipesForPrestigeTuning()
+			end
+		end)
+	end
 
 	-- Handle manual respawn (player clicks "Reset Character" in Roblox menu).
 	-- Two-phase approach:
@@ -661,6 +852,13 @@ function GameController.startReady()
 	LeaderboardUI.show()
 	ReadyUI.showShopButton()
 	ReadyUI.showMissionsButton()
+	if PRESTIGE_ENABLED then
+		ReadyUI.showPrestigeButton()
+		ReadyUI.setPrestigeReadyIndicator(PrestigeManager.isPrestigeReady())
+		PrestigeUI.hide()
+	else
+		ReadyUI.hidePrestigeButton()
+	end
 	CurrencyUI.show()
 
 	-- Start hover animation for player
@@ -676,8 +874,8 @@ function GameController.startReady()
 		if currentState ~= "ready" then return end
 		-- Block input while a manual respawn is in progress
 		if isRespawning then return end
-		-- Block input while shop or missions modal is open
-		if ShopUI.isOpen() or MissionsUI.isOpen() then return end
+		-- Block input while any ready-state modal is open
+		if ShopUI.isOpen() or MissionsUI.isOpen() or PrestigeUI.isOpen() then return end
 
 		-- Open shop or missions directly on pointer input over their buttons.
 		if input.UserInputType == Enum.UserInputType.Touch
@@ -686,6 +884,9 @@ function GameController.startReady()
 				if MissionsUI.isOpen() then
 					MissionsUI.hide()
 				end
+				if PrestigeUI.isOpen() then
+					PrestigeUI.hide()
+				end
 				ShopUI.show()
 				return
 			end
@@ -693,7 +894,20 @@ function GameController.startReady()
 				if ShopUI.isOpen() then
 					ShopUI.hide()
 				end
+				if PrestigeUI.isOpen() then
+					PrestigeUI.hide()
+				end
 				MissionsUI.show()
+				return
+			end
+			if PRESTIGE_ENABLED and ReadyUI.isPrestigeButtonMouseOver() then
+				if ShopUI.isOpen() then
+					ShopUI.hide()
+				end
+				if MissionsUI.isOpen() then
+					MissionsUI.hide()
+				end
+				PrestigeUI.show()
 				return
 			end
 		end
@@ -706,15 +920,20 @@ function GameController.startReady()
 			if gameProcessed
 				or LeaderboardUI.isMouseOver()
 				or ReadyUI.isShopButtonMouseOver()
-				or ReadyUI.isMissionsButtonMouseOver() then
+				or ReadyUI.isMissionsButtonMouseOver()
+				or ReadyUI.isPrestigeButtonMouseOver() then
 				return
 			end
 		end
 
 		-- Hide ready UI and start playing
 		ReadyUI.hide()
+		ReadyUI.hideShopButton()
+		ReadyUI.hideMissionsButton()
+		ReadyUI.hidePrestigeButton()
 		ShopUI.hide()
 		MissionsUI.hide()
+		PrestigeUI.hide()
 		GameController.startGame()
 
 		-- Trigger the first jump immediately
@@ -735,8 +954,14 @@ function GameController.startGame()
 	currentState = "playing"
 	GameState.setState(GameConfig.STATES.PLAYING)
 	MissionManager.reportEvent("run_started")
+	if PRESTIGE_ENABLED then
+		PrestigeManager.reportRunStarted()
+	end
 	ShopUI.hide()
 	MissionsUI.hide()
+	if PRESTIGE_ENABLED then
+		PrestigeUI.hide()
+	end
 
 	-- Analytics: track game start + progression begin
 	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.GAME_START)
@@ -790,6 +1015,9 @@ function GameController.gameOver()
 	GameState.setState(GameConfig.STATES.GAME_OVER)
 	ShopUI.hide()
 	MissionsUI.hide()
+	if PRESTIGE_ENABLED then
+		PrestigeUI.hide()
+	end
 
 	-- Resolve any collected bacon whose fly animation has not finished yet.
 	-- This keeps final score in sync with collected bacon even on death frames.
@@ -803,9 +1031,41 @@ function GameController.gameOver()
 
 	-- Analytics: track game over + progression result
 	local finalScore = ScoreManager.getScore()
-	MissionManager.reportEvent("run_finished", { score = finalScore })
+	local runtimeTuning = RuntimeTuning.getActiveTuning()
+	local currentSpeedMultiplier = SpeedManager and SpeedManager.getCurrentMultiplier and SpeedManager.getCurrentMultiplier() or nil
+	local missionRunFinishedPayload = buildRuntimeMissionPayload(finalScore)
+	if currentSpeedMultiplier ~= nil then
+		missionRunFinishedPayload.maxSpeedMultiplierReached = currentSpeedMultiplier
+	end
+	MissionManager.reportEvent("run_finished", missionRunFinishedPayload)
+	if PRESTIGE_ENABLED then
+		PrestigeManager.reportRunFinished(finalScore, {
+			maxSpeedMultiplierReached = currentSpeedMultiplier,
+		})
+	end
 	local currentSpeed = SpeedManager and SpeedManager.getCurrentSpeed and SpeedManager.getCurrentSpeed() or nil
-	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.GAME_OVER, finalScore, { speed = currentSpeed })
+	local prestigeState = PrestigeManager.getState()
+	local prestigeLevel = prestigeState and prestigeState.progression and prestigeState.progression.level or 0
+	local speedCap = runtimeTuning.speedCapMultiplier
+	local gravity = runtimeTuning.gravity
+	local jumpPower = runtimeTuning.jumpPowerMultiplier
+
+	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.GAME_OVER, finalScore, {
+		speed = currentSpeed,
+		speedCap = speedCap,
+		gravity = gravity,
+		jumpPower = jumpPower,
+		prestigeLevel = prestigeLevel,
+	})
+	if PRESTIGE_ENABLED then
+		Analytics.logCustomEvent(AnalyticsConfig.EVENTS.PRESTIGE_RUN_OUTCOME, finalScore, {
+			score = finalScore,
+			speedCap = speedCap,
+			gravity = gravity,
+			jumpPower = jumpPower,
+			prestigeLevel = prestigeLevel,
+		})
+	end
 	if finalScore > 0 then
 		Analytics.logProgressionComplete(AnalyticsConfig.PROGRESSION.RUN, nil, finalScore)
 	else
@@ -893,7 +1153,8 @@ function GameController.gameOver()
 			if gameProcessed
 				or LeaderboardUI.isMouseOver()
 				or ReadyUI.isShopButtonMouseOver()
-				or ReadyUI.isMissionsButtonMouseOver() then
+				or ReadyUI.isMissionsButtonMouseOver()
+				or ReadyUI.isPrestigeButtonMouseOver() then
 				return
 			end
 		end
@@ -907,6 +1168,13 @@ end
 	Restores default Roblox behavior for hub area.
 ]]
 function GameController.returnToLobby()
+	if currentState == "playing" then
+		MissionManager.reportEvent("run_abandoned")
+		if PRESTIGE_ENABLED then
+			PrestigeManager.reportRunAbandoned()
+		end
+	end
+
 	Analytics.logCustomEvent(AnalyticsConfig.EVENTS.RETURN_TO_LOBBY)
 	disconnectAll()
 	currentState = "menu"
@@ -990,6 +1258,7 @@ function GameController.destroy()
 	CurrencyUI.destroy()
 	ShopUI.destroy()
 	MissionsUI.destroy()
+	PrestigeUI.destroy()
 	StartButton.destroy()
 	OptionsUI.destroy()
 	DebugCameraUI.destroy()
@@ -1019,6 +1288,16 @@ function GameController.destroy()
 	if humanoidDiedConnection then
 		humanoidDiedConnection:Disconnect()
 		humanoidDiedConnection = nil
+	end
+
+	if debugProgressResetConnection then
+		debugProgressResetConnection:Disconnect()
+		debugProgressResetConnection = nil
+	end
+
+	if speedDebugLogToggleConnection then
+		speedDebugLogToggleConnection:Disconnect()
+		speedDebugLogToggleConnection = nil
 	end
 end
 

@@ -10,10 +10,12 @@
 ]]
 
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PlayerConfig = require(ReplicatedStorage.Shared.PlayerConfig)
 local GameConfig = require(ReplicatedStorage.Shared.GameConfig)
 local PipeConfig = require(ReplicatedStorage.Shared.PipeConfig)
+local RuntimeTuning = require(ReplicatedStorage.Shared.RuntimeTuning)
 local Pipe = require(script.Parent.Pipe)
 
 local PipeManager = {}
@@ -30,6 +32,17 @@ local onPipePassedCallback = nil
 local onPipeSpawnedCallback = nil
 local totalDistanceTraveled = 0
 local previousGapY = nil
+local localPlayer = Players.LocalPlayer
+local gapIndicatorGui = nil
+local gapIndicatorLabel = nil
+
+local GAP_INDICATOR_VERTICAL_PADDING_RATIO = 0.02
+local GAP_INDICATOR_SIZE_RATIO = 0.06
+local GAP_INDICATOR_PLAYER_X_OFFSET_RATIO = 0.045
+local GAP_INDICATOR_MIN_SIZE = 24
+local GAP_INDICATOR_MAX_SIZE = 64
+local GAP_INDICATOR_MIN_X_OFFSET = 14
+local GAP_INDICATOR_MIN_VERTICAL_PADDING = 8
 
 --[[
 	Resolved styles table — built at init time.
@@ -45,6 +58,165 @@ local function poolKey(styleIndex, orientation)
 	return styleIndex .. "_" .. orientation
 end
 
+local function getInternalSpeedMultiplierCap()
+	local configCap = tonumber(GameConfig.SPEED.INTERNAL_MULTIPLIER_CAP)
+		or tonumber(GameConfig.SPEED.MAX_MULTIPLIER)
+	local initialMultiplier = tonumber(GameConfig.SPEED.INITIAL_MULTIPLIER) or 1
+	return math.max(initialMultiplier, configCap or initialMultiplier)
+end
+
+local function getSelectedSpeedRampMultiplier()
+	local runtimeRamp = nil
+	if RuntimeTuning.getActiveSpeedRampMultiplier then
+		runtimeRamp = tonumber(RuntimeTuning.getActiveSpeedRampMultiplier())
+	else
+		runtimeRamp = tonumber(RuntimeTuning.getActiveSpeedCapMultiplier())
+	end
+
+	local defaultRamp = tonumber(GameConfig.SPEED.RAMP_RATE_MULTIPLIER_DEFAULT)
+		or tonumber(GameConfig.SPEED.INITIAL_MULTIPLIER)
+		or 1.0
+	return math.max(0, runtimeRamp or defaultRamp)
+end
+
+local function hideGapIndicator()
+	if gapIndicatorLabel then
+		gapIndicatorLabel.Visible = false
+	end
+end
+
+local function destroyGapIndicator()
+	if gapIndicatorGui then
+		gapIndicatorGui:Destroy()
+	end
+	gapIndicatorGui = nil
+	gapIndicatorLabel = nil
+end
+
+local function ensureGapIndicator()
+	if gapIndicatorGui and gapIndicatorLabel and gapIndicatorGui.Parent then
+		return
+	end
+
+	if not localPlayer then
+		return
+	end
+
+	local playerGui = localPlayer:FindFirstChild("PlayerGui") or localPlayer:WaitForChild("PlayerGui", 5)
+	if not playerGui then
+		return
+	end
+
+	destroyGapIndicator()
+
+	gapIndicatorGui = Instance.new("ScreenGui")
+	gapIndicatorGui.Name = "GapIndicatorUI"
+	gapIndicatorGui.ResetOnSpawn = false
+	gapIndicatorGui.IgnoreGuiInset = true
+	gapIndicatorGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gapIndicatorGui.Parent = playerGui
+
+	gapIndicatorLabel = Instance.new("TextLabel")
+	gapIndicatorLabel.Name = "GapIndicatorArrow"
+	gapIndicatorLabel.Size = UDim2.fromOffset(GAP_INDICATOR_MIN_SIZE, GAP_INDICATOR_MIN_SIZE)
+	gapIndicatorLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	gapIndicatorLabel.BackgroundTransparency = 1
+	gapIndicatorLabel.Text = ">"
+	gapIndicatorLabel.TextColor3 = Color3.fromRGB(255, 0, 0)
+	gapIndicatorLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	gapIndicatorLabel.TextStrokeTransparency = 0.35
+	gapIndicatorLabel.TextScaled = true
+	gapIndicatorLabel.Font = Enum.Font.GothamBlack
+	gapIndicatorLabel.Visible = false
+	gapIndicatorLabel.ZIndex = 50
+	gapIndicatorLabel.Parent = gapIndicatorGui
+end
+
+local function getNextUpcomingPipePair(playerX)
+	for _, pair in ipairs(activePipePairs) do
+		if pair.xPosition >= playerX then
+			return pair
+		end
+	end
+	return nil
+end
+
+local function updateGapIndicator(playerPos)
+	ensureGapIndicator()
+	if not gapIndicatorLabel then
+		return
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera then
+		hideGapIndicator()
+		return
+	end
+
+	local viewportSize = camera.ViewportSize
+	if viewportSize.X <= 0 or viewportSize.Y <= 0 then
+		hideGapIndicator()
+		return
+	end
+
+	if not playerPos then
+		hideGapIndicator()
+		return
+	end
+
+	local playerX = playerPos.X
+
+	local nextPair = getNextUpcomingPipePair(playerX)
+	if not nextPair or nextPair.gapY == nil then
+		hideGapIndicator()
+		return
+	end
+
+	local pipeHalfWidth = PipeConfig.WIDTH / 2
+	local leftEdgeViewport = camera:WorldToViewportPoint(Vector3.new(nextPair.xPosition - pipeHalfWidth, nextPair.gapY, 0))
+	local rightEdgeViewport = camera:WorldToViewportPoint(Vector3.new(nextPair.xPosition + pipeHalfWidth, nextPair.gapY, 0))
+
+	-- Only show the indicator when the entire next pipe pair is still off the right side.
+	if leftEdgeViewport.Z <= 0 or rightEdgeViewport.Z <= 0 or leftEdgeViewport.X <= viewportSize.X then
+		hideGapIndicator()
+		return
+	end
+
+	local gapCenterViewport = camera:WorldToViewportPoint(Vector3.new(camera.CFrame.Position.X, nextPair.gapY, 0))
+	if gapCenterViewport.Z <= 0 then
+		hideGapIndicator()
+		return
+	end
+
+	local indicatorSize = math.clamp(
+		math.floor(math.min(viewportSize.X, viewportSize.Y) * GAP_INDICATOR_SIZE_RATIO),
+		GAP_INDICATOR_MIN_SIZE,
+		GAP_INDICATOR_MAX_SIZE
+	)
+	local xOffset = math.max(GAP_INDICATOR_MIN_X_OFFSET, viewportSize.X * GAP_INDICATOR_PLAYER_X_OFFSET_RATIO)
+	local verticalPadding = math.max(GAP_INDICATOR_MIN_VERTICAL_PADDING, viewportSize.Y * GAP_INDICATOR_VERTICAL_PADDING_RATIO)
+	gapIndicatorLabel.Size = UDim2.fromOffset(indicatorSize, indicatorSize)
+
+	local playerViewport = camera:WorldToViewportPoint(Vector3.new(playerPos.X, playerPos.Y, 0))
+	if playerViewport.Z <= 0 then
+		hideGapIndicator()
+		return
+	end
+
+	local clampedX = math.clamp(
+		playerViewport.X + xOffset,
+		verticalPadding + (indicatorSize / 2),
+		viewportSize.X - verticalPadding - (indicatorSize / 2)
+	)
+	local clampedY = math.clamp(
+		gapCenterViewport.Y,
+		verticalPadding + (indicatorSize / 2),
+		viewportSize.Y - verticalPadding - (indicatorSize / 2)
+	)
+	gapIndicatorLabel.Position = UDim2.fromOffset(clampedX, clampedY)
+	gapIndicatorLabel.Visible = true
+end
+
 --[[
 	Initializes the PipeManager.
 	@param playerCtrl PlayerController - The PlayerController instance
@@ -56,6 +228,8 @@ function PipeManager.init(playerCtrl, speedMgr)
 	nextSpawnX = 0
 	totalDistanceTraveled = 0
 	previousGapY = nil
+	ensureGapIndicator()
+	hideGapIndicator()
 
 	PipeManager.resolveStyles()
 end
@@ -160,20 +334,68 @@ end
 	Uses PipeConfig functions for all spawn decisions.
 	@param xPosition number - X position to spawn at
 	@param speedMultiplier number|nil - Speed override for spacing calculation
+	@param speedCapMultiplier number|nil - Active speed cap (for cap-aware spacing tuning)
+	@param forwardSpeed number|nil - Actual/estimated forward speed for gap-variance tuning
 	@return number - The spacing to use before the next pipe pair
 ]]
-local function spawnPipePair(xPosition, speedMultiplier)
+local function spawnPipePair(xPosition, speedMultiplier, speedCapMultiplier, forwardSpeed)
 	-- Resolve speed
 	local spd = speedMultiplier
 	if not spd and SpeedManager then
 		spd = SpeedManager.getCurrentMultiplier()
 	end
+	local spdCap = tonumber(speedCapMultiplier)
+	if not spdCap and SpeedManager and SpeedManager.getCurrentTargetMultiplierCap then
+		spdCap = tonumber(SpeedManager.getCurrentTargetMultiplierCap())
+	end
+	spdCap = spdCap or getInternalSpeedMultiplierCap()
+	local fwdSpd = tonumber(forwardSpeed)
+	if not fwdSpd and SpeedManager and SpeedManager.getCurrentSpeed then
+		fwdSpd = tonumber(SpeedManager.getCurrentSpeed())
+	end
+	if not fwdSpd then
+		local baseForwardSpeed = tonumber(PlayerConfig.BASE_FORWARD_SPEED) or 0
+		local safeMultiplier = tonumber(spd) or (tonumber(GameConfig.SPEED.INITIAL_MULTIPLIER) or 1)
+		fwdSpd = baseForwardSpeed * safeMultiplier
+	end
+
+	-- Spacing should scale with actual movement speed, not only the legacy
+	-- multiplier. This keeps high-speed runs from becoming unfairly dense when
+	-- extra speed pressure is applied outside the multiplier cap.
+	local baseForwardSpeed = math.max(0.0001, tonumber(PlayerConfig.BASE_FORWARD_SPEED) or 0.0001)
+	local spacingSpeedMultiplier = tonumber(spd) or (tonumber(GameConfig.SPEED.INITIAL_MULTIPLIER) or 1)
+	if fwdSpd then
+		spacingSpeedMultiplier = math.max(spacingSpeedMultiplier, fwdSpd / baseForwardSpeed)
+	end
+	local spacingCapMultiplier = math.max(spdCap, spacingSpeedMultiplier)
 
 	-- Make spawn decisions via PipeConfig
 	local gapSize = PipeConfig.getGapSize(totalDistanceTraveled)
-	local gapY = PipeConfig.getGapY(gapSize, previousGapY)
-	local spacing = PipeConfig.getSpacing(spd)
+	local gapY, gapYDebug = PipeConfig.getGapY(gapSize, previousGapY, {
+		forwardSpeed = fwdSpd,
+		speedMultiplier = spd,
+		speedCapMultiplier = spdCap,
+	})
+	local spacing, spacingDebug = PipeConfig.getSpacing(spacingSpeedMultiplier, {
+		speedCapMultiplier = spacingCapMultiplier,
+		forwardSpeed = fwdSpd,
+	})
 	local styleIndex = PipeConfig.getStyleIndex(#resolvedStyles)
+
+	if SpeedManager and SpeedManager.recordDebugPipeSpacingSample then
+		SpeedManager.recordDebugPipeSpacingSample(spacing, {
+			spacingSpeedMultiplier = spacingSpeedMultiplier,
+			speedCapMultiplier = spacingCapMultiplier,
+			forwardSpeed = fwdSpd,
+			gapXMin = spacingDebug and spacingDebug.minSpacing,
+			gapXMax = spacingDebug and spacingDebug.maxSpacing,
+			gapXEffectiveSpeed = spacingDebug and spacingDebug.effectiveSpeed,
+			gapY = gapY,
+			gapYMin = gapYDebug and gapYDebug.minY,
+			gapYMax = gapYDebug and gapYDebug.maxY,
+			gapYMaxDelta = gapYDebug and gapYDebug.maxDelta,
+		})
+	end
 
 	previousGapY = gapY
 
@@ -218,18 +440,64 @@ function PipeManager.preSpawnPipes()
 
 	nextSpawnX = playerX + firstPipeDistance
 
-	-- Pre-spawn with speed-estimated spacing
-	local baseSpeed = PlayerConfig.BASE_FORWARD_SPEED
-	local increaseRate = GameConfig.SPEED.INCREASE_RATE
-	local maxMultiplier = GameConfig.SPEED.MAX_MULTIPLIER
+	-- Pre-spawn using the same predicted run-speed timeline used at runtime
+	-- (unified progression curve when enabled) so READY pipes match gameplay.
+	local selectedRampMultiplier = getSelectedSpeedRampMultiplier()
+	local predictedTargetMultiplierCap = getInternalSpeedMultiplierCap()
+	if SpeedManager and SpeedManager.getTargetMultiplierCapForRampSetting then
+		predictedTargetMultiplierCap = tonumber(SpeedManager.getTargetMultiplierCapForRampSetting(selectedRampMultiplier))
+			or predictedTargetMultiplierCap
+	end
+	local initialMultiplier = tonumber(GameConfig.SPEED.INITIAL_MULTIPLIER) or 1
+
+	local function getPredictedRunSpeed(elapsedSeconds)
+		if SpeedManager and SpeedManager.getPredictedSpeedAtElapsed then
+			local predictedSpeed = SpeedManager.getPredictedSpeedAtElapsed(elapsedSeconds, selectedRampMultiplier, predictedTargetMultiplierCap)
+			if tonumber(predictedSpeed) then
+				return math.max(0.001, tonumber(predictedSpeed))
+			end
+		end
+
+		local baseSpeed = tonumber(PlayerConfig.BASE_FORWARD_SPEED) or 0
+		local increaseRate = (tonumber(GameConfig.SPEED.INCREASE_RATE) or 0) * selectedRampMultiplier
+		local predictedMultiplier = math.min(initialMultiplier + (math.max(0, tonumber(elapsedSeconds) or 0) * increaseRate), predictedTargetMultiplierCap)
+		return math.max(0.001, baseSpeed * predictedMultiplier)
+	end
+
+	local function getPredictedRunMultiplier(elapsedSeconds)
+		if SpeedManager and SpeedManager.getPredictedMultiplierAtElapsed then
+			local predictedMultiplier = SpeedManager.getPredictedMultiplierAtElapsed(elapsedSeconds, selectedRampMultiplier, predictedTargetMultiplierCap)
+			if tonumber(predictedMultiplier) then
+				return tonumber(predictedMultiplier)
+			end
+		end
+
+		local increaseRate = (tonumber(GameConfig.SPEED.INCREASE_RATE) or 0) * selectedRampMultiplier
+		return math.min(initialMultiplier + (math.max(0, tonumber(elapsedSeconds) or 0) * increaseRate), predictedTargetMultiplierCap)
+	end
+
+	local function estimateTravelTime(distanceStuds, startElapsedSeconds)
+		local distance = math.max(0, tonumber(distanceStuds) or 0)
+		if distance <= 0 then
+			return 0
+		end
+
+		local startElapsed = math.max(0, tonumber(startElapsedSeconds) or 0)
+		local startSpeed = getPredictedRunSpeed(startElapsed)
+		local roughDt = distance / math.max(0.001, startSpeed)
+		local midSpeed = getPredictedRunSpeed(startElapsed + (roughDt * 0.5))
+
+		return distance / math.max(0.001, midSpeed)
+	end
+
+	local simulatedElapsed = estimateTravelTime(firstPipeDistance, 0)
 
 	for i = 1, PipeConfig.PRE_SPAWN_COUNT do
-		local distFromStart = nextSpawnX - playerX
-		local estimatedTime = distFromStart / baseSpeed
-		local estimatedMultiplier = math.min(1 + increaseRate * estimatedTime, maxMultiplier)
-
-		local spacing = spawnPipePair(nextSpawnX, estimatedMultiplier)
+		local estimatedMultiplier = getPredictedRunMultiplier(simulatedElapsed)
+		local estimatedForwardSpeed = getPredictedRunSpeed(simulatedElapsed)
+		local spacing = spawnPipePair(nextSpawnX, estimatedMultiplier, predictedTargetMultiplierCap, estimatedForwardSpeed)
 		nextSpawnX = nextSpawnX + spacing
+		simulatedElapsed = simulatedElapsed + estimateTravelTime(spacing, simulatedElapsed)
 	end
 end
 
@@ -242,11 +510,20 @@ function PipeManager.start()
 	end
 
 	updateConnection = RunService.Heartbeat:Connect(function(deltaTime)
-		if not PipeConfig.ENABLED then return end
-		if not PlayerController then return end
+		if not PipeConfig.ENABLED then
+			hideGapIndicator()
+			return
+		end
+		if not PlayerController then
+			hideGapIndicator()
+			return
+		end
 
 		local playerPos = PlayerController.getPosition()
-		if not playerPos then return end
+		if not playerPos then
+			hideGapIndicator()
+			return
+		end
 
 		local playerX = playerPos.X
 		totalDistanceTraveled = playerX
@@ -297,6 +574,8 @@ function PipeManager.start()
 				end
 			end
 		end
+
+		updateGapIndicator(playerPos)
 	end)
 end
 
@@ -308,6 +587,7 @@ function PipeManager.stop()
 		updateConnection:Disconnect()
 		updateConnection = nil
 	end
+	hideGapIndicator()
 end
 
 --[[
@@ -315,6 +595,11 @@ end
 ]]
 function PipeManager.clear()
 	PipeManager.stop()
+	hideGapIndicator()
+
+	if SpeedManager and SpeedManager.clearDebugPipeSpacingSamples then
+		SpeedManager.clearDebugPipeSpacingSamples()
+	end
 
 	for _, pair in ipairs(activePipePairs) do
 		if pair.top then pair.top:destroy() end
@@ -359,6 +644,7 @@ end
 ]]
 function PipeManager.destroy()
 	PipeManager.clear()
+	destroyGapIndicator()
 	resolvedStyles = {}
 end
 
