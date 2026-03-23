@@ -4,3 +4,7 @@
 # Roblox Studio lock files
 /*.rbxlx.lock
 /*.rbxl.lock
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
